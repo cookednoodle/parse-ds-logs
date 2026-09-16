@@ -96,8 +96,22 @@ Struct names are looked up as written, then with the C++ namespace left off, the
 case-insensitively. An unknown name fails immediately and suggests close matches. JSON is
 accepted in place of YAML.
 
+Map the full message struct, the one that carries the CCSDS primary and secondary headers as
+well as the payload. That is the normal case: the tool recognizes the header, leaves its fields
+out of the payload columns because they are already in the fixed leading columns, and decodes
+the struct from the first byte of the packet. The header is recognized whether it is written as
+the header type directly or reached through an app typedef of it:
+
+```c
+typedef struct {
+    CFE_MSG_TelemetryHeader_t TelemetryHeader;   /* recognized */
+    MY_APP_HkTlm_Payload_t    Payload;
+} MY_APP_HkTlm_t;
+```
+
 Mapping a struct that has no cFS message header of its own, a bare payload type, also works:
-the tool notices and decodes it starting after the packet header.
+the tool notices and decodes it starting after the packet header. See **Limitations** for two
+ways of embedding a header that are not recognized.
 
 ## 5. Decode
 
@@ -166,6 +180,22 @@ the bus. The CCSDS headers are big-endian.
 - Decoding a big-endian target's payloads is wired up but untested.
 - Virtually inherited base classes are skipped, with a warning: their offset is only known at
   run time.
+- Only a header at the top level of a mapped struct is recognized, so two ways of embedding one
+  are not handled yet:
+  - A C++ class that *inherits* from `CFE_MSG_TelemetryHeader_t` rather than holding it as a
+    member. The base class is flattened during extraction, so only the innermost message member
+    matches and the secondary header and spare bytes leak in as extra columns
+    (`Sec.Time[0]` and so on). The payload values are still correct.
+  - A header *nested inside another struct*, such as a member `Base` whose own first member is
+    the header. Nothing at the top level matches, so the struct is treated as a bare payload and
+    decoded from the packet's payload offset instead of from byte 0. Every field then reads
+    16 bytes too far into the packet. The run warns that the struct has no message header, but
+    the CSV it writes is wrong rather than empty, so check that warning if you see one.
+
+  Both fall out of one fix: instead of skipping a single header member, work out the header
+  *region* at the start of the struct (descend the members at offset 0 to find the first known
+  header type, then widen the region to the full telemetry or command header size if a secondary
+  header is present) and drop every field that falls inside it.
 
 ## Tests
 

@@ -30,6 +30,11 @@ from .typemodel import (
 
 # Members of these types carry the packet header, which is reported in the
 # fixed leading columns instead of being repeated per message type.
+#
+# Only a header at the top level of a mapped struct is matched, by walk_top
+# below.  A header a C++ class inherits from, or one nested inside another
+# member, is not recognized yet; see Limitations in the README for what each
+# does today and for the header-region fix that covers both.
 HEADER_TYPES = frozenset(
     [
         "CFE_MSG_Message_t",
