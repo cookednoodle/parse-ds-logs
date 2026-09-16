@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsdecode"
+version = "0.1.0"
+description = "Decode cFS Data Storage (DS) log files to CSV using message definitions read from DWARF debug info"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+dependencies = [
+    # 0.33 is the first release to require Python 3.10; 0.32 has the same DWARF 2-5 support.
+    "pyelftools>=0.30,<0.33",
+    "PyYAML>=5.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    # pytest 9 requires Python 3.10.
+    "pytest<9",
+    "vermin>=1.5",
+]
+
+[project.scripts]
+dsdecode = "dsdecode.cli:main"
+
+[tool.setuptools]
+packages = ["dsdecode"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
