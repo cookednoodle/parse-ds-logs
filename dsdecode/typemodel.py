@@ -239,6 +239,9 @@ class TypeRegistry:
     # later decode can tell a struct that was never here from one added to the
     # mapping after this file was written.
     unresolved: List[str] = field(default_factory=list)
+    # Packet header types this project declared beyond the cFE ones, carried
+    # here so a declaration made once at extract time reaches every decode.
+    header_types: List[str] = field(default_factory=list)
     filtered: bool = False
 
     def __post_init__(self) -> None:
@@ -300,6 +303,7 @@ class TypeRegistry:
             "filtered": self.filtered,
             "roots": dict((k, list(v)) for k, v in sorted(self.roots.items())),
             "unresolved": sorted(self.unresolved),
+            "header_types": sorted(self.header_types),
             "types": dict((k, v.to_json()) for k, v in sorted(self.types.items())),
         }
 
@@ -323,6 +327,7 @@ class TypeRegistry:
             conflicts=list(data.get("conflicts") or []),
             roots=dict((k, list(v)) for k, v in (data.get("roots") or {}).items()),
             unresolved=[str(name) for name in (data.get("unresolved") or [])],
+            header_types=[str(name) for name in (data.get("header_types") or [])],
             filtered=bool(data.get("filtered")),
         )
         for name, node in (data.get("types") or {}).items():

@@ -73,14 +73,22 @@ class DecodeError(Exception):
 class Options:
     """Knobs that change how values are rendered."""
 
-    __slots__ = ("char_arrays", "enum_values", "max_depth")
+    __slots__ = ("char_arrays", "enum_values", "max_depth", "header_types")
 
     def __init__(
-        self, char_arrays: str = "text", enum_values: bool = False, max_depth: int = MAX_DEPTH
+        self,
+        char_arrays: str = "text",
+        enum_values: bool = False,
+        max_depth: int = MAX_DEPTH,
+        header_types: Optional[Any] = None,
     ) -> None:
         self.char_arrays = char_arrays
         self.enum_values = enum_values
         self.max_depth = max_depth
+        # Packet header types beyond the cFE ones below, for a project that
+        # defines its own.  A typedef of a declared type counts too, since the
+        # chain is followed.
+        self.header_types = frozenset(header_types or ())
 
 
 class _Field(object):
@@ -283,6 +291,8 @@ class _Builder(object):
         self.fields = []  # type: List[_Field]
         self.prefix_char = ">" if registry.endian == "big" else "<"
         self._used = {}  # type: Dict[str, int]
+        # The cFE headers plus whatever this project declared.
+        self._known_headers = HEADER_TYPES | options.header_types
         # Why each field was left out, in the order the reasons first came up.
         self.dropped = {}  # type: Dict[str, List[str]]
 
@@ -322,11 +332,12 @@ class _Builder(object):
         return _UINT_FORMATS.get(size)
 
     def _is_header(self, type_key: str) -> bool:
+        known = self._known_headers
         for name in self.registry.typedef_chain(type_key):
-            if name in HEADER_TYPES:
+            if name in known:
                 return True
         resolved = self.registry.resolve_name(type_key)
-        return resolved in HEADER_TYPES
+        return resolved in known
 
     # -- walk ------------------------------------------------------------
 

@@ -41,6 +41,17 @@ def _warn(message: str) -> None:
     print("warning: %s" % message, file=sys.stderr)
 
 
+def _declared_headers(args: argparse.Namespace) -> List[str]:
+    """Header type names from --header-type, repeated or comma separated."""
+    names = []  # type: List[str]
+    for argument in getattr(args, "header_type", None) or []:
+        for name in argument.split(","):
+            name = name.strip()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
 def _load_registry(path: str) -> TypeRegistry:
     with io.open(path, "r", encoding="utf-8") as handle:
         return TypeRegistry.load(handle)
@@ -90,6 +101,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
     except DwarfError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
+    # Carried in the type file so a decode honours it without being told again.
+    registry.header_types = _declared_headers(args)
+    if args.mids and mapping.header_types:
+        for name in mapping.header_types:
+            if name not in registry.header_types:
+                registry.header_types.append(name)
     out_dir = os.path.dirname(os.path.abspath(args.output))
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir)
@@ -229,7 +246,11 @@ def cmd_decode(args: argparse.Namespace) -> int:
         print("error: cannot read %s: %s" % (args.types, exc), file=sys.stderr)
         return 1
     geometry = Geometry.from_registry(registry, _ccsds_v2(args))
-    options = Options(char_arrays=args.char_arrays, enum_values=args.enum_values)
+    options = Options(
+        char_arrays=args.char_arrays,
+        enum_values=args.enum_values,
+        header_types=_declared_headers(args),
+    )
     try:
         dictionary = Dictionary.load(args.mids, registry, geometry, options, warn=_warn)
     except DictionaryError as exc:
@@ -425,6 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
             "depend on, instead of every type in the build"
         ),
     )
+    _add_header_type_arg(extract_parser)
     extract_parser.add_argument(
         "--strict",
         action="store_true",
@@ -469,6 +491,7 @@ def build_parser() -> argparse.ArgumentParser:
     decode_parser.add_argument(
         "--enum-values", action="store_true", help="report enums as numbers, not names"
     )
+    _add_header_type_arg(decode_parser)
     decode_parser.add_argument(
         "--epoch",
         help="mission epoch, such as 1980-01-01, to add a UTC timestamp column",
@@ -477,6 +500,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_layout_args(decode_parser)
     decode_parser.set_defaults(func=cmd_decode)
     return parser
+
+
+def _add_header_type_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--header-type",
+        action="append",
+        metavar="NAME",
+        help=(
+            "a packet header type this project defines, beyond the cFE ones; "
+            "repeat or separate with commas. A typedef of a declared type "
+            "counts too, so name the underlying struct"
+        ),
+    )
 
 
 def _add_layout_args(parser: argparse.ArgumentParser) -> None:

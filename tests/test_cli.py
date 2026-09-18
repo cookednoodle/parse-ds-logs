@@ -760,3 +760,129 @@ def test_a_generated_map_decodes_the_same_values_as_a_hand_written_one(
         dict((k, v) for k, v in row.items() if k.startswith("Payload.")) for row in rows
     ]
     assert payload(left) == payload(right)
+
+
+# -- a project that defines its own header types ---------------------------
+
+
+PROJ_MIDS = "mids:\n  PROJ_TLM_MID: {value: 0x0890, struct: PROJ_Tlm_t}\n"
+
+
+def proj_packet(counter, words):
+    """A packet laid out by the project's 12 byte header, not the cFE one."""
+    payload = struct.pack("<I3H", counter, *words) + b"\x00\x00"
+    body = struct.pack(">I", 50) + struct.pack(">H", 0) + payload
+    total = 6 + len(body)
+    return struct.pack(">HHH", 0x0890, (3 << 14) | 1, total - 7) + body
+
+
+@pytest.fixture
+def proj_workspace(tmp_path, fixture_so):
+    mids = str(tmp_path / "proj.yaml")
+    with io.open(mids, "w", encoding="utf-8") as handle:
+        handle.write(PROJ_MIDS)
+    ds = str(tmp_path / "proj.ds")
+    mk.write_ds_file(ds, [proj_packet(7, (1, 2, 3))])
+    return {"so": fixture_so, "mids": mids, "ds": ds, "dir": str(tmp_path)}
+
+
+def decode_proj(workspace, tmp_path, name, extra_extract=(), extra_decode=()):
+    types = str(tmp_path / ("types-%s.json" % name))
+    assert (
+        main(
+            ["extract", "--mids", workspace["mids"], "-o", types]
+            + list(extra_extract)
+            + [workspace["so"]]
+        )
+        == 0
+    )
+    out_dir = str(tmp_path / ("out-%s" % name))
+    code = main(
+        [
+            "decode",
+            "--types",
+            types,
+            "--mids",
+            workspace["mids"],
+            "--out",
+            out_dir,
+        ]
+        + list(extra_decode)
+        + [workspace["ds"]]
+    )
+    return code, types, out_dir
+
+
+def test_an_undeclared_project_header_decodes_wrongly_and_says_so(
+    proj_workspace, tmp_path, capsys
+):
+    code, _, out_dir = decode_proj(proj_workspace, tmp_path, "plain")
+    assert code == 0
+    rows = read_csv(os.path.join(out_dir, "PROJ_TLM_MID.csv"))
+    # Read from the cFE payload offset of 16 rather than this header's 12, so
+    # the header bytes appear as columns and Counter is not 7.
+    assert "TlmHeader.tPriHdr.StreamId[0]" in rows[0]
+    assert rows[0].get("Counter") != "7"
+    assert "--header-type" in capsys.readouterr().err
+
+
+def test_declaring_the_header_on_decode_fixes_it(proj_workspace, tmp_path):
+    code, _, out_dir = decode_proj(
+        proj_workspace,
+        tmp_path,
+        "declared",
+        extra_decode=["--header-type", "PROJ_MSG_TLM_HDR_T"],
+    )
+    assert code == 0
+    rows = read_csv(os.path.join(out_dir, "PROJ_TLM_MID.csv"))
+    assert list(rows[0])[-4:] == ["Counter", "Words[0]", "Words[1]", "Words[2]"]
+    assert rows[0]["Counter"] == "7"
+    assert [rows[0]["Words[%d]" % i] for i in range(3)] == ["1", "2", "3"]
+
+
+def test_declaring_it_at_extract_time_carries_into_decode(proj_workspace, tmp_path):
+    code, types, out_dir = decode_proj(
+        proj_workspace,
+        tmp_path,
+        "carried",
+        extra_extract=["--header-type", "PROJ_MSG_TLM_HDR_T"],
+    )
+    assert code == 0
+    assert read_types(types)["header_types"] == ["PROJ_MSG_TLM_HDR_T"]
+    # No flag on the decode: the type file carried the declaration.
+    rows = read_csv(os.path.join(out_dir, "PROJ_TLM_MID.csv"))
+    assert rows[0]["Counter"] == "7"
+
+
+def test_several_header_types_fit_in_one_argument(proj_workspace, tmp_path):
+    code, types, out_dir = decode_proj(
+        proj_workspace,
+        tmp_path,
+        "commas",
+        extra_extract=["--header-type", "PROJ_MSG_TLM_HDR_T,OTHER_HDR_T"],
+    )
+    assert code == 0
+    assert read_types(types)["header_types"] == ["OTHER_HDR_T", "PROJ_MSG_TLM_HDR_T"]
+    assert read_csv(os.path.join(out_dir, "PROJ_TLM_MID.csv"))[0]["Counter"] == "7"
+
+
+def test_the_cfe_path_is_unchanged_by_all_this(workspace, tmp_path):
+    out_dir = str(tmp_path / "out-cfe")
+    assert (
+        main(
+            [
+                "decode",
+                "--types",
+                workspace["types"],
+                "--mids",
+                workspace["mids"],
+                "--out",
+                out_dir,
+                workspace["ds"],
+            ]
+        )
+        == 0
+    )
+    rows = read_csv(os.path.join(out_dir, "SAMPLE_HK_TLM_MID.csv"))
+    assert rows[0]["Payload.Name"] == "hello"
+    assert "TelemetryHeader.Msg.CCSDS.Pri.StreamId[0]" not in rows[0]

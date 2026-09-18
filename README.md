@@ -92,6 +92,37 @@ Mapping a struct that has no cFS message header of its own, a bare payload type,
 the tool notices and decodes it starting after the packet header. See **Limitations** for two
 ways of embedding a header that are not recognized.
 
+### If your project defines its own header types
+
+A header is recognized by name, against the cFE types: `CFE_MSG_TelemetryHeader_t`,
+`CFE_MSG_CommandHeader_t`, `CFE_MSG_Message_t`, the older `CFE_SB_TlmHdr_t` and `CFE_SB_CmdHdr_t`,
+and the `CCSDS_*` packet types. Plenty of projects define their own instead, wire compatible with
+cFE by hand rather than by any compiler enforced link, sometimes under names that look like cFE
+without being it. Those are not recognized, and an unrecognized header is the one failure worth
+watching for: the message is taken for a bare payload, decoding starts at the packet's payload
+offset instead of byte 0, and every field reads late. You get a warning naming the struct when
+that happens.
+
+Declare them and it works:
+
+```
+dsdecode extract --header-type MY_MSG_TLM_HDR_T,MY_MSG_CMD_HDR_T --mids mids.yaml -o types.json ...
+```
+
+Name the underlying struct, not a typedef of it. The typedef chain is followed, so declaring
+`MY_MSG_TLM_HDR_T` also covers any alias of it, including one named to look like cFE. Extract
+records the declaration in the type file, so `decode` honours it without being told again.
+`decode` takes the same flag for a one-off, and a hand-written mapping can carry the list instead:
+
+```yaml
+header_types: [MY_MSG_TLM_HDR_T, MY_MSG_CMD_HDR_T]
+mids:
+  MY_APP_HK_TLM_MID: {value: 0x0890, struct: MyApp::HkTlm_t}
+```
+
+A declared header needs no particular size. If yours has no trailing spare where the cFE one does,
+the struct's own layout is what gets used, so the payload starts where that struct says it does.
+
 ### If a script already finds your message IDs
 
 If you generate a message ID map by scanning your flight software, pass that file to `--mids`

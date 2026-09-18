@@ -130,7 +130,9 @@ def test_a_payload_struct_warns_that_it_has_no_header(tmp_path, registry):
         registry,
         warn=warnings.append,
     )
-    assert any("no cFS message header" in w for w in warnings)
+    assert any("does not start with a header this build knows" in w for w in warnings)
+    # The warning says what to do about it, not only what happened.
+    assert any("--header-type" in w for w in warnings)
 
 
 def test_options_reach_the_compiled_decoder(tmp_path, registry):
@@ -562,3 +564,70 @@ def test_a_struct_not_recorded_as_absent_still_says_to_re_extract(tmp_path, regi
             Geometry.from_registry(broken),
             warn=lambda message: None,
         )
+
+
+# -- declaring a project's own header types --------------------------------
+
+
+def test_header_types_declared_in_the_mapping_reach_the_decoder(tmp_path, registry):
+    mids = load(
+        tmp_path,
+        "header_types: [PROJ_MSG_TLM_HDR_T]\n"
+        "mids:\n  PROJ: {value: 0x0890, struct: PROJ_Tlm_t}\n",
+        registry,
+    )
+    decoder = mids.lookup(0x0890).decoder_for(None)
+    assert decoder.has_header
+    assert decoder.header_size == 12
+    assert decoder.columns == ["Counter", "Words[0]", "Words[1]", "Words[2]"]
+
+
+def test_header_types_work_in_a_file_with_no_mids_key(tmp_path, registry):
+    # The short form, where the whole document is message IDs.
+    mids = load(
+        tmp_path,
+        "header_types: [PROJ_MSG_TLM_HDR_T]\n" "0x0890: PROJ_Tlm_t\n",
+        registry,
+    )
+    entry = mids.lookup(0x0890)
+    assert entry is not None, "the declaration must not be read as a message ID"
+    assert entry.decoder_for(None).has_header
+
+
+def test_header_types_recorded_in_the_type_file_reach_the_decoder(tmp_path, registry):
+    from dsdecode.typemodel import TypeRegistry
+
+    carried = TypeRegistry(
+        types=dict(registry.types),
+        endian=registry.endian,
+        pointer_size=registry.pointer_size,
+        geometry=dict(registry.geometry),
+        header_types=["PROJ_MSG_TLM_HDR_T"],
+    )
+    mids = Dictionary.load(
+        write_mids(tmp_path, "mids:\n  PROJ: {value: 0x0890, struct: PROJ_Tlm_t}\n"),
+        carried,
+        Geometry.from_registry(carried),
+    )
+    assert mids.lookup(0x0890).decoder_for(None).has_header
+
+
+def test_header_types_passed_by_the_caller_reach_the_decoder(tmp_path, registry):
+    mids = load(
+        tmp_path,
+        "mids:\n  PROJ: {value: 0x0890, struct: PROJ_Tlm_t}\n",
+        registry,
+        options=Options(header_types=["PROJ_MSG_TLM_HDR_T"]),
+    )
+    assert mids.lookup(0x0890).decoder_for(None).has_header
+
+
+def test_an_undeclared_project_header_warns_with_the_remedy(tmp_path, registry):
+    warnings = []
+    load(
+        tmp_path,
+        "mids:\n  PROJ: {value: 0x0890, struct: PROJ_Tlm_t}\n",
+        registry,
+        warn=warnings.append,
+    )
+    assert any("PROJ_Tlm_t" in w and "--header-type" in w for w in warnings)

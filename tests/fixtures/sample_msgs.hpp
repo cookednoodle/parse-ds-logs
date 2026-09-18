@@ -109,4 +109,47 @@ typedef struct
     };
 } ANON_Tlm_t;
 
+/* A project that defines its own header types rather than using the cFE ones,
+ * then gives them cFE looking names.  The structs are wire compatible with cFE
+ * by hand, not by any compiler enforced link, and this one has no trailing
+ * Spare, so it is 12 bytes where the cFE telemetry header is 16.  Nothing here
+ * carries a name the decoder knows, which is the point. */
+typedef struct
+{
+    uint8 StreamId[2];
+    uint8 Sequence[2];
+    uint8 Length[2];
+} PROJ_PRI_HDR_T;
+
+typedef struct
+{
+    uint8 iTime[6];
+} PROJ_TLM_SEC_HDR_T;
+
+typedef struct
+{
+    PROJ_PRI_HDR_T     tPriHdr;
+    PROJ_TLM_SEC_HDR_T tSecHdr;
+} PROJ_MSG_TLM_HDR_T;
+
+/* Named to look like cFE, but a typedef of the project's own struct. */
+typedef PROJ_MSG_TLM_HDR_T CFE_MSG_TLM_HDR_T;
+
+typedef struct
+{
+    CFE_MSG_TLM_HDR_T TlmHeader;
+    uint32            Counter;
+    uint16            Words[3];
+} PROJ_Tlm_t;
+
+/* A payload with no header at all, whose first three fields are two bytes
+ * each.  Guards against anything that tries to spot a header by its shape. */
+typedef struct
+{
+    uint16 First;
+    uint16 Second;
+    uint16 Third;
+    uint32 Rest;
+} PROJ_Payload_t;
+
 #endif /* DSDECODE_SAMPLE_MSGS_HPP */

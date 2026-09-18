@@ -265,3 +265,65 @@ def test_every_type_in_the_build_compiles_without_a_warning(registry):
     for name in names:
         compile_struct(registry, name, warn=warnings.append)
     assert warnings == []
+
+
+# -- a project's own header types -------------------------------------------
+
+
+def test_a_header_under_a_name_of_its_own_is_not_recognized_by_default(registry):
+    """The failure this exists to fix, with the fixture's project header."""
+    warnings = []
+    decoder = compile_struct(registry, "PROJ_Tlm_t", warn=warnings.append)
+    assert not decoder.has_header
+    # The header fields leak in, which is the visible symptom.
+    assert decoder.columns[0] == "TlmHeader.tPriHdr.StreamId[0]"
+
+
+def test_declaring_the_header_type_makes_it_recognized(registry):
+    decoder = compile_struct(
+        registry, "PROJ_Tlm_t", Options(header_types=["PROJ_MSG_TLM_HDR_T"])
+    )
+    assert decoder.has_header
+    # Twelve, not sixteen: this header has no trailing spare.
+    assert decoder.header_size == 12
+    assert decoder.columns == ["Counter", "Words[0]", "Words[1]", "Words[2]"]
+
+
+def test_declaring_a_typedef_of_the_header_works_too(registry):
+    # The struct's member is written as the alias, so either name will do.
+    decoder = compile_struct(
+        registry, "PROJ_Tlm_t", Options(header_types=["CFE_MSG_TLM_HDR_T"])
+    )
+    assert decoder.has_header
+    assert decoder.header_size == 12
+    assert decoder.columns == ["Counter", "Words[0]", "Words[1]", "Words[2]"]
+
+
+def test_a_payload_beginning_with_three_short_fields_is_not_a_header(registry):
+    """Header spotting is by name, so this shape is never mistaken for one."""
+    decoder = compile_struct(
+        registry, "PROJ_Payload_t", Options(header_types=["PROJ_MSG_TLM_HDR_T"])
+    )
+    assert not decoder.has_header
+    assert decoder.columns == ["First", "Second", "Third", "Rest"]
+
+
+def test_the_built_in_cfe_headers_still_work_with_nothing_declared(registry):
+    decoder = compile_struct(registry, "sample::HkTlm_t")
+    assert decoder.has_header
+    assert decoder.header_size == 16
+
+
+def test_declared_values_decode_at_the_right_offsets(registry):
+    import struct as _struct
+
+    # A packet built the way the project's header lays it out: 12 byte header,
+    # then the payload.
+    raw = b"\x08\x90\xc0\x2a\x00\x11" + b"\x12\x34\x56\x78\x80\x00"
+    raw += _struct.pack("<I3H", 7, 1, 2, 3) + b"\x00\x00"
+    decoder = compile_struct(
+        registry, "PROJ_Tlm_t", Options(header_types=["PROJ_MSG_TLM_HDR_T"])
+    )
+    row = dict(zip(decoder.columns, decoder.decode(raw)))
+    assert row["Counter"] == 7
+    assert [row["Words[%d]" % i] for i in range(3)] == [1, 2, 3]

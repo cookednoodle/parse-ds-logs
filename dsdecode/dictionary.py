@@ -109,7 +109,7 @@ class MidEntry(object):
 class Mapping(object):
     """A mapping file that has been read and checked, but not compiled."""
 
-    __slots__ = ("path", "entries", "skipped", "skipped_apps", "generated")
+    __slots__ = ("path", "entries", "skipped", "skipped_apps", "generated", "header_types")
 
     def __init__(
         self,
@@ -118,9 +118,12 @@ class Mapping(object):
         skipped: Optional[List[Tuple[str, str]]] = None,
         skipped_apps: Optional[List[str]] = None,
         generated: bool = False,
+        header_types: Optional[List[str]] = None,
     ) -> None:
         self.path = path
         self.entries = entries
+        # Packet header types this project defines, declared in the file.
+        self.header_types = header_types or []
         # (name, why) for entries a generated map could not resolve.
         self.skipped = skipped or []
         # Directories the generating scanner did not look at.
@@ -178,7 +181,12 @@ def read_mapping(path: str) -> Mapping:
             raise DictionaryError("cannot read %s: %s" % (path, exc))
     if not isinstance(data, dict):
         raise DictionaryError("%s must hold a mapping with a 'mids' key" % path)
+    declared = [str(name) for name in (data.get("header_types") or [])]
     mids = data.get("mids", data)
+    if mids is data and declared:
+        # A file with no 'mids' key is all message IDs, so lift the
+        # declaration out before it is read as one.
+        mids = dict((k, v) for k, v in data.items() if k != "header_types")
     if not isinstance(mids, dict) or not mids:
         raise DictionaryError("%s has no message IDs under 'mids'" % path)
     if _looks_generated(data, mids):
@@ -194,8 +202,13 @@ def read_mapping(path: str) -> Mapping:
             skipped=skipped,
             skipped_apps=[str(app) for app in (data.get("skipped_apps") or [])],
             generated=True,
+            header_types=declared,
         )
-    return Mapping(path, [_read_entry(key, value) for key, value in mids.items()])
+    return Mapping(
+        path,
+        [_read_entry(key, value) for key, value in mids.items()],
+        header_types=declared,
+    )
 
 
 def _looks_generated(data: Dict[str, Any], mids: Dict[Any, Any]) -> bool:
@@ -346,6 +359,18 @@ class Dictionary(object):
         dictionary = cls(registry, geometry)
         index = _NameIndex(registry)
         options = options or Options()
+        # A project's own header types can be declared in the mapping, recorded
+        # in the type file at extract time, or passed on the command line.
+        declared = set(options.header_types)
+        declared.update(mapping.header_types)
+        declared.update(registry.header_types)
+        if declared != set(options.header_types):
+            options = Options(
+                char_arrays=options.char_arrays,
+                enum_values=options.enum_values,
+                max_depth=options.max_depth,
+                header_types=declared,
+            )
         # Structs the type file says this build does not have.  Their message
         # IDs are passed over rather than failing the run.
         left_out = frozenset(registry.unresolved)
@@ -366,8 +391,10 @@ class Dictionary(object):
             for decoder in entry.decoders.values():
                 if not decoder.has_header:
                     warn(
-                        "%s has no cFS message header, so it is decoded as a bare "
-                        "payload starting after the packet header" % decoder.type_name
+                        "%s does not start with a header this build knows, so it is "
+                        "decoded as a bare payload from the packet's payload offset. "
+                        "If it does carry a header under a name of your own, declare "
+                        "that type with --header-type." % decoder.type_name
                     )
         if dropped:
             shown = ", ".join(dropped[:3])
