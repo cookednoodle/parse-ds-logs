@@ -57,6 +57,7 @@ def workspace(tmp_path, fixture_so, sample_hk):
     mk.write_ds_file(ds_path, packets)
     return {
         "dir": str(tmp_path),
+        "so": fixture_so,
         "types": types_path,
         "mids": mids_path,
         "ds": ds_path,
@@ -377,3 +378,139 @@ def test_a_bad_mapping_file_is_reported(workspace, tmp_path, capsys):
 def test_no_subcommand_prints_help(capsys):
     assert main([]) == 2
     assert "extract" in capsys.readouterr().out
+
+
+# -- extracting only what the mapping needs --------------------------------
+
+
+def read_types(path):
+    with io.open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def test_a_filtered_extract_is_far_smaller(workspace, tmp_path, capsys):
+    small = str(tmp_path / "types-small.json")
+    assert main(["extract", "--mids", workspace["mids"], "-o", small, workspace["so"]]) == 0
+    full_types = read_types(workspace["types"])
+    small_types = read_types(small)
+    assert not full_types["filtered"]
+    assert small_types["filtered"]
+    assert len(small_types["types"]) * 3 < len(full_types["types"])
+    # The structs the mapping names, and the ones they are built from.
+    assert "sample::HkTlm_t" in small_types["types"]
+    assert "sample::HkPayload" in small_types["types"]
+    assert "sample::UnionTlm_t" not in small_types["types"]
+    out = capsys.readouterr().out
+    assert "structs from the mapping" in out
+    assert "sample::HkTlm_t" in out
+
+
+def test_filtered_and_unfiltered_type_files_decode_identically(workspace, tmp_path):
+    small = str(tmp_path / "types-small.json")
+    main(["extract", "--mids", workspace["mids"], "-o", small, workspace["so"]])
+    outputs = []
+    for index, types in enumerate((workspace["types"], small)):
+        out_dir = str(tmp_path / ("decode%d" % index))
+        assert (
+            main(
+                [
+                    "decode",
+                    "--types",
+                    types,
+                    "--mids",
+                    workspace["mids"],
+                    "--out",
+                    out_dir,
+                    "--epoch",
+                    "1980-01-01",
+                    workspace["ds"],
+                ]
+            )
+            == 0
+        )
+        outputs.append(out_dir)
+    first, second = outputs
+    assert sorted(os.listdir(first)) == sorted(os.listdir(second))
+    assert os.listdir(first)
+    for name in sorted(os.listdir(first)):
+        with io.open(os.path.join(first, name), "r", encoding="utf-8") as handle:
+            left = handle.read()
+        with io.open(os.path.join(second, name), "r", encoding="utf-8") as handle:
+            right = handle.read()
+        assert left == right, "%s differs between the two type files" % name
+
+
+def test_verbose_lists_the_types_kept_for_auditing(workspace, tmp_path, capsys):
+    small = str(tmp_path / "types-small.json")
+    main(["extract", "--mids", workspace["mids"], "-o", small, "-v", workspace["so"]])
+    out = capsys.readouterr().out
+    assert "types kept:" in out
+    assert "sample::HkPayload" in out
+
+
+def test_an_unqualified_name_is_reported_with_what_it_matched(workspace, tmp_path, capsys):
+    mids = str(tmp_path / "short-names.yaml")
+    with io.open(mids, "w", encoding="utf-8") as handle:
+        handle.write("mids:\n  HK: {value: 0x0890, struct: HkTlm_t}\n")
+    small = str(tmp_path / "types-short.json")
+    assert main(["extract", "--mids", mids, "-o", small, workspace["so"]]) == 0
+    assert read_types(small)["roots"] == {"HkTlm_t": ["sample::HkTlm_t"]}
+    assert "sample::HkTlm_t" in capsys.readouterr().out
+
+
+def test_a_struct_missing_from_the_build_fails_the_extract(workspace, tmp_path, capsys):
+    mids = str(tmp_path / "typo.yaml")
+    with io.open(mids, "w", encoding="utf-8") as handle:
+        handle.write("mids:\n  HK: {value: 0x0890, struct: sample::HkTlmX_t}\n")
+    out = str(tmp_path / "types-typo.json")
+    assert main(["extract", "--mids", mids, "-o", out, workspace["so"]]) == 1
+    assert "sample::HkTlmX_t" in capsys.readouterr().err
+    assert not os.path.exists(out)
+
+
+def test_allow_missing_writes_the_file_anyway(workspace, tmp_path, capsys):
+    mids = str(tmp_path / "partial.yaml")
+    with io.open(mids, "w", encoding="utf-8") as handle:
+        handle.write(
+            "mids:\n"
+            "  HK: {value: 0x0890, struct: sample::HkTlm_t}\n"
+            "  GONE: {value: 0x0899, struct: NotBuiltYet_t}\n"
+        )
+    out = str(tmp_path / "types-partial.json")
+    assert (
+        main(["extract", "--mids", mids, "--allow-missing", "-o", out, workspace["so"]]) == 0
+    )
+    assert read_types(out)["roots"] == {"sample::HkTlm_t": ["sample::HkTlm_t"]}
+    assert "NotBuiltYet_t" in capsys.readouterr().err
+
+
+def test_a_mapping_that_grew_says_to_extract_again(workspace, tmp_path, capsys):
+    small = str(tmp_path / "types-small.json")
+    main(["extract", "--mids", workspace["mids"], "-o", small, workspace["so"]])
+    grown = str(tmp_path / "grown.yaml")
+    with io.open(grown, "w", encoding="utf-8") as handle:
+        handle.write(MIDS + "  EXTRA_TLM_MID: {value: 0x0899, struct: sample::UnionTlm_t}\n")
+    code = main(
+        [
+            "decode",
+            "--types",
+            small,
+            "--mids",
+            grown,
+            "--out",
+            str(tmp_path / "out-grown"),
+            workspace["ds"],
+        ]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "sample::UnionTlm_t" in err
+    assert "re-run" in err and "extract --mids" in err
+
+
+def test_a_malformed_mapping_is_caught_at_extract_time(workspace, tmp_path, capsys):
+    mids = str(tmp_path / "broken.yaml")
+    with io.open(mids, "w", encoding="utf-8") as handle:
+        handle.write("mids:\n  NO_VALUE_MID: {struct: sample::HkTlm_t}\n")
+    assert main(["extract", "--mids", mids, "-o", str(tmp_path / "x.json"), workspace["so"]]) == 1
+    assert "no message ID" in capsys.readouterr().err

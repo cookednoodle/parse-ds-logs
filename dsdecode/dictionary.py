@@ -8,7 +8,6 @@ choose a struct by function code.
 
 from __future__ import annotations
 
-import difflib
 import io
 import os
 import sys
@@ -18,13 +17,17 @@ import yaml
 
 from .decode import Decoder, DecodeError, Options, compile_struct
 from .dsfile import Geometry
-from .typemodel import KIND_STRUCT, KIND_UNION, TypeRegistry
+from .typemodel import KIND_STRUCT, KIND_UNION, TypeRegistry, close_names
 
 _SAFE_CHARS = "-_."
 
 
 class DictionaryError(Exception):
     """Raised when the mapping file cannot be used."""
+
+
+class UnknownStructError(DictionaryError):
+    """Raised when a struct the mapping names is not in the type file."""
 
 
 def safe_name(name: str) -> str:
@@ -51,7 +54,13 @@ def parse_int(value: Any, what: str) -> int:
 
 
 class MidEntry(object):
-    """One message ID and how to decode its packets."""
+    """One message ID and how to decode its packets.
+
+    ``read_mapping`` fills everything but ``decoders``, which needs a type
+    registry and is attached by :meth:`Dictionary.load`.  That split is what
+    lets ``dsdecode extract`` learn which structs a mapping wants before any
+    types have been read.
+    """
 
     __slots__ = ("name", "value", "default_struct", "by_fcn", "decoders", "file_name")
 
@@ -73,6 +82,52 @@ class MidEntry(object):
         if fcn_code is not None and fcn_code in self.decoders:
             return "%s_fcn%d" % (self.file_name, fcn_code)
         return self.file_name
+
+
+class Mapping(object):
+    """A mapping file that has been read and checked, but not compiled."""
+
+    __slots__ = ("path", "entries")
+
+    def __init__(self, path: str, entries: List[MidEntry]) -> None:
+        self.path = path
+        self.entries = entries
+
+    def struct_names(self) -> List[str]:
+        """Every struct the mapping names, in file order, without repeats."""
+        names = []  # type: List[str]
+        seen = set()  # type: set
+        for entry in self.entries:
+            for name in [entry.default_struct] + list(entry.by_fcn.values()):
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        return names
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+
+def read_mapping(path: str) -> Mapping:
+    """Read and check a mapping file without needing any types.
+
+    Everything that can be judged from the file alone is judged here, so
+    ``dsdecode extract --mids`` rejects a malformed mapping with the same
+    message ``decode`` would give, just earlier.
+    """
+    if not os.path.exists(path):
+        raise DictionaryError("mapping file %s does not exist" % path)
+    with io.open(path, "r", encoding="utf-8") as handle:
+        try:
+            data = yaml.safe_load(handle)
+        except yaml.YAMLError as exc:
+            raise DictionaryError("cannot read %s: %s" % (path, exc))
+    if not isinstance(data, dict):
+        raise DictionaryError("%s must hold a mapping with a 'mids' key" % path)
+    mids = data.get("mids", data)
+    if not isinstance(mids, dict) or not mids:
+        raise DictionaryError("%s has no message IDs under 'mids'" % path)
+    return Mapping(path, [_read_entry(key, value) for key, value in mids.items()])
 
 
 class Dictionary(object):
@@ -101,24 +156,13 @@ class Dictionary(object):
         warn: Optional[Any] = None,
     ) -> "Dictionary":
         warn = warn or (lambda msg: print("warning: %s" % msg, file=sys.stderr))
-        if not os.path.exists(path):
-            raise DictionaryError("mapping file %s does not exist" % path)
-        with io.open(path, "r", encoding="utf-8") as handle:
-            try:
-                data = yaml.safe_load(handle)
-            except yaml.YAMLError as exc:
-                raise DictionaryError("cannot read %s: %s" % (path, exc))
-        if not isinstance(data, dict):
-            raise DictionaryError("%s must hold a mapping with a 'mids' key" % path)
-        mids = data.get("mids", data)
-        if not isinstance(mids, dict) or not mids:
-            raise DictionaryError("%s has no message IDs under 'mids'" % path)
+        mapping = read_mapping(path)
 
         dictionary = cls(registry, geometry)
         index = _NameIndex(registry)
         options = options or Options()
-        for key, value in mids.items():
-            entry = _read_entry(key, value, index, options, registry)
+        for entry in mapping.entries:
+            _compile_entry(entry, index, options, registry)
             existing = dictionary.entries.get(entry.value)
             if existing is not None:
                 warn(
@@ -136,9 +180,8 @@ class Dictionary(object):
         return dictionary
 
 
-def _read_entry(
-    key: Any, value: Any, index: "_NameIndex", options: Options, registry: TypeRegistry
-) -> MidEntry:
+def _read_entry(key: Any, value: Any) -> MidEntry:
+    """Turn one line of the mapping into an entry, with no decoders yet."""
     name = None  # type: Optional[str]
     mid_value = None  # type: Optional[int]
     if isinstance(key, int) or (isinstance(key, str) and _looks_numeric(key)):
@@ -173,23 +216,32 @@ def _read_entry(
     entry = MidEntry(name=name, value=mid_value)
     if isinstance(struct_spec, str):
         entry.default_struct = struct_spec
-        entry.decoders[None] = _compile(struct_spec, index, options, registry, name)
     elif isinstance(struct_spec, dict):
         default = struct_spec.get("default")
         if default is not None:
             entry.default_struct = str(default)
-            entry.decoders[None] = _compile(str(default), index, options, registry, name)
         for fcn, struct_name in (struct_spec.get("fcn") or {}).items():
             code = parse_int(fcn, "function code in %s" % name)
             entry.by_fcn[code] = str(struct_name)
-            entry.decoders[code] = _compile(str(struct_name), index, options, registry, name)
-        if not entry.decoders:
+        if entry.default_struct is None and not entry.by_fcn:
             raise DictionaryError(
                 "entry %s needs a 'default' struct, one or more 'fcn' entries, or both" % name
             )
     else:
         raise DictionaryError("entry %s has an unreadable 'struct' value" % name)
     return entry
+
+
+def _compile_entry(
+    entry: MidEntry, index: "_NameIndex", options: Options, registry: TypeRegistry
+) -> None:
+    """Attach a decoder to an entry for each struct it names."""
+    if entry.default_struct is not None:
+        entry.decoders[None] = _compile(
+            entry.default_struct, index, options, registry, entry.name
+        )
+    for code, struct_name in entry.by_fcn.items():
+        entry.decoders[code] = _compile(struct_name, index, options, registry, entry.name)
 
 
 def _compile(
@@ -240,14 +292,14 @@ class _NameIndex(object):
                 raise DictionaryError(
                     "struct %r is ambiguous; write one of: %s" % (wanted, ", ".join(matches))
                 )
-        raise DictionaryError(
+        raise UnknownStructError(
             "struct %r is not in the type file%s" % (wanted, self._suggest(wanted))
         )
 
     def _suggest(self, wanted: str) -> str:
         tail = wanted.rsplit("::", 1)[-1]
         close = []  # type: List[str]
-        for match in difflib.get_close_matches(tail, sorted(self._by_tail), n=5, cutoff=0.6):
+        for match in close_names(wanted, self._by_tail):
             close.extend(self._by_tail.get(match, []))
         if not close:
             lowered = tail.lower()

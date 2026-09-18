@@ -34,6 +34,7 @@ from .typemodel import (
     TypeRegistry,
     TypedefType,
     array_key,
+    close_names,
     pointer_key,
 )
 
@@ -169,11 +170,138 @@ def _anon_key(prefix: str, signature: str) -> str:
     return "%s:%s" % (prefix, digest)
 
 
+# How a mapping name matched a type, best first.  These mirror the tiers in
+# dictionary._NameIndex.resolve.
+TIER_EXACT = 0
+TIER_TAIL = 1
+TIER_CASE = 2
+
+_TIER_NAMES = {TIER_EXACT: "exactly", TIER_TAIL: "by name without its namespace", TIER_CASE: "ignoring case"}
+
+
+class NameFilter(object):
+    """Decides which types an extraction keeps, and records what matched.
+
+    The rules mirror the struct lookup in ``dictionary._NameIndex``: a name
+    matches a type exactly, or by the part after the last ``::``, or ignoring
+    case.  Keeping the two in step is what stops a struct resolving here and
+    then failing at decode time.
+    """
+
+    def __init__(self, names: Sequence[str], always: Sequence[str] = ()) -> None:
+        self.wanted = []  # type: List[str]
+        self.optional = set()  # type: Set[str]
+        self.resolved = {}  # type: Dict[str, Dict[int, List[str]]]
+        # Every named type seen anywhere in the build, for suggesting a
+        # correction when a mapping name is not found.
+        self.seen_names = set()  # type: Set[str]
+        self._exact = {}  # type: Dict[str, List[str]]
+        self._by_tail = {}  # type: Dict[str, List[str]]
+        self._by_lower = {}  # type: Dict[str, List[str]]
+        self._quick = set()  # type: Set[str]
+        for name in names:
+            self._add(name, False)
+        for name in always:
+            self._add(name, True)
+
+    def _add(self, name: str, optional: bool) -> None:
+        name = (name or "").strip()
+        if not name or name in self.resolved:
+            return
+        self.wanted.append(name)
+        self.resolved[name] = {}
+        if optional:
+            self.optional.add(name)
+        tail = name.rsplit("::", 1)[-1]
+        # Keyed by the mapping name, looked up with what a type offers.
+        self._exact.setdefault(name, []).append(name)
+        self._by_tail.setdefault(name, []).append(name)
+        self._by_lower.setdefault(name.lower(), []).append(name)
+        for text in (name, tail):
+            self._quick.add(text)
+            self._quick.add(text.lower())
+
+    # -- matching --------------------------------------------------------
+
+    def wants(self, name: str) -> bool:
+        """Cheap test on a type's own name, before qualifying it costs anything.
+
+        Never rejects a name that :meth:`match` would accept: every rule there
+        needs the type's own name to equal a mapping name, or the tail of one,
+        give or take case.
+        """
+        return name in self._quick or name.lower() in self._quick
+
+    def match(self, qualified: str) -> List[Tuple[str, int]]:
+        """Every mapping name this type satisfies, with how it matched."""
+        tail = qualified.rsplit("::", 1)[-1]
+        out = []  # type: List[Tuple[str, int]]
+        for wanted in self._exact.get(qualified, ()):
+            out.append((wanted, TIER_EXACT))
+        for wanted in self._by_tail.get(tail, ()):
+            out.append((wanted, TIER_TAIL))
+        for key in (qualified.lower(), tail.lower()):
+            for wanted in self._by_lower.get(key, ()):
+                out.append((wanted, TIER_CASE))
+        return out
+
+    # -- results ---------------------------------------------------------
+
+    def record(self, wanted: str, tier: int, key: str) -> None:
+        tiers = self.resolved.setdefault(wanted, {})
+        keys = tiers.setdefault(tier, [])
+        if key not in keys:
+            keys.append(key)
+
+    def resolution(self, wanted: str) -> List[str]:
+        """The types a mapping name resolves to, from its best matching rule."""
+        tiers = self.resolved.get(wanted) or {}
+        for tier in sorted(tiers):
+            if tiers[tier]:
+                return sorted(tiers[tier])
+        return []
+
+    def tier_of(self, wanted: str) -> Optional[int]:
+        tiers = self.resolved.get(wanted) or {}
+        for tier in sorted(tiers):
+            if tiers[tier]:
+                return tier
+        return None
+
+    def describe(self, wanted: str) -> str:
+        """How a mapping name resolved, for the extract summary."""
+        keys = self.resolution(wanted)
+        if not keys:
+            return "not found"
+        tier = self.tier_of(wanted)
+        how = "" if tier == TIER_EXACT else " (matched %s)" % _TIER_NAMES.get(tier, "")
+        return "%s%s" % (", ".join(keys), how)
+
+    def missing(self) -> List[str]:
+        return [w for w in self.wanted if w not in self.optional and not self.resolution(w)]
+
+    def ambiguous(self) -> List[Tuple[str, List[str]]]:
+        found = []  # type: List[Tuple[str, List[str]]]
+        for wanted in self.wanted:
+            keys = self.resolution(wanted)
+            if len(keys) > 1:
+                found.append((wanted, keys))
+        return found
+
+
 class Extractor:
     """Builds a :class:`TypeRegistry` from one or more ELF files."""
 
-    def __init__(self, verbose: bool = False, warn: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        warn: Optional[Any] = None,
+        names: Optional[NameFilter] = None,
+    ) -> None:
         self.registry = TypeRegistry()
+        # When set, only the types this filter matches are registered; their
+        # dependencies still follow, because _key_for_die recurses.
+        self._names = names
         self.verbose = verbose
         self._warn_fn = warn or (lambda msg: print("warning: %s" % msg, file=sys.stderr))
         self._warned = set()  # type: Set[str]
@@ -233,7 +361,7 @@ class Extractor:
 
     def _read_cu(self, cu: Any) -> int:
         self._pointer_size = cu["address_size"] or self._pointer_size
-        interesting = []  # type: List[Any]
+        interesting = []  # type: List[Tuple[Any, Any]]
         self._anon_names = {}
         try:
             dies = list(cu.iter_DIEs())
@@ -244,17 +372,36 @@ class Extractor:
             if die.is_null():
                 continue
             tag = die.tag
-            if tag == "DW_TAG_typedef":
-                interesting.append(die)
+            is_typedef = tag == "DW_TAG_typedef"
+            if is_typedef:
+                # Runs whether or not the typedef is wanted: it is what gives
+                # "typedef struct {...} Foo_t" its name.
                 self._note_anon_typedef(die)
-            elif tag in _WALK_TAGS and _die_name(die) is not None:
-                interesting.append(die)
+            elif tag not in _WALK_TAGS:
+                continue
+            name = _die_name(die)
+            if self._names is None:
+                if is_typedef or name is not None:
+                    interesting.append((die, ()))
+                continue
+            if name is None:
+                continue
+            self._names.seen_names.add(name)
+            if not self._names.wants(name):
+                continue
+            matches = self._names.match(self._qualify(die, name))
+            if matches:
+                interesting.append((die, matches))
         before = len(self.registry.types)
-        for die in interesting:
+        for die, matches in interesting:
             try:
-                self._key_for_die(die)
+                key = self._key_for_die(die)
             except Exception as exc:  # keep going; one bad type is not fatal
                 self.warn("could not read type at DIE offset 0x%x: %s" % (die.offset, exc))
+                continue
+            if matches and key and key != VOID_KEY and self._names is not None:
+                for wanted, tier in matches:
+                    self._names.record(wanted, tier, key)
         return len(self.registry.types) - before
 
     def _note_anon_typedef(self, die: Any) -> None:
@@ -619,9 +766,20 @@ class Extractor:
                 self.registry.geometry[name] = size
 
 
-def extract(paths: Sequence[str], verbose: bool = False, warn: Optional[Any] = None) -> TypeRegistry:
-    """Read every type from ``paths`` into one registry."""
-    extractor = Extractor(verbose=verbose, warn=warn)
+def extract(
+    paths: Sequence[str],
+    verbose: bool = False,
+    warn: Optional[Any] = None,
+    names: Optional[NameFilter] = None,
+    allow_missing: bool = False,
+) -> TypeRegistry:
+    """Read types from ``paths`` into one registry.
+
+    With no ``names`` filter this reads every type in the given files.  With
+    one, it keeps the types that filter matches and, through the recursion in
+    ``_key_for_die``, everything those types are built from.
+    """
+    extractor = Extractor(verbose=verbose, warn=warn, names=names)
     errors = []  # type: List[str]
     for path in paths:
         if not os.path.exists(path):
@@ -631,8 +789,44 @@ def extract(paths: Sequence[str], verbose: bool = False, warn: Optional[Any] = N
             extractor.add_file(path)
         except DwarfError as exc:
             errors.append(str(exc))
-    if not extractor.registry.sources:
+    registry = extractor.registry
+    if not registry.sources:
         raise DwarfError("; ".join(errors) or "no input files")
     for message in errors:
         extractor.warn(message)
-    return extractor.registry
+    if names is not None:
+        _finish_filtered(registry, names, extractor, allow_missing)
+    return registry
+
+
+def _finish_filtered(
+    registry: TypeRegistry, names: NameFilter, extractor: Extractor, allow_missing: bool
+) -> None:
+    """Record what each mapping name resolved to, and report what did not."""
+    registry.filtered = True
+    registry.roots = dict(
+        (wanted, names.resolution(wanted))
+        for wanted in names.wanted
+        if wanted not in names.optional and names.resolution(wanted)
+    )
+    for wanted, keys in names.ambiguous():
+        extractor.warn(
+            "%r matches more than one type in this build (%s); all of them are kept, "
+            "so write the one you mean in the mapping" % (wanted, ", ".join(keys))
+        )
+    missing = names.missing()
+    if not missing:
+        return
+    details = []  # type: List[str]
+    for wanted in missing:
+        hint = close_names(wanted, names.seen_names)
+        details.append("%s%s" % (wanted, (" (did you mean %s?)" % ", ".join(hint)) if hint else ""))
+    message = "%d struct(s) named in the mapping are not in %s: %s" % (
+        len(missing),
+        ", ".join(registry.sources),
+        "; ".join(details),
+    )
+    if allow_missing:
+        extractor.warn(message)
+    else:
+        raise DwarfError(message)

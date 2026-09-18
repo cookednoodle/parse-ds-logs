@@ -9,6 +9,7 @@ deterministic synthetic key so that identical types share one node.
 
 from __future__ import annotations
 
+import difflib
 import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, IO, List, Optional, Union
@@ -192,6 +193,16 @@ GEOMETRY_DEFAULTS = {
 }
 
 
+def close_names(wanted: str, pool: Any, limit: int = 5) -> List[str]:
+    """Names from ``pool`` that look like ``wanted``, for an error message.
+
+    Shared by the extractor and the mapping loader so a misspelled struct gets
+    the same kind of hint wherever it is caught.
+    """
+    tail = wanted.rsplit("::", 1)[-1]
+    return difflib.get_close_matches(tail, sorted(pool), n=limit, cutoff=0.6)
+
+
 def array_key(elem: str, dims: List[int]) -> str:
     """Synthetic registry key for an array type."""
     return "%s[%s]" % (elem, "][".join(str(d) for d in dims))
@@ -214,6 +225,10 @@ class TypeRegistry:
     geometry: Dict[str, int] = field(default_factory=dict)
     sources: List[str] = field(default_factory=list)
     conflicts: List[str] = field(default_factory=list)
+    # Set when extraction was filtered to a mapping: which registry type each
+    # name in that mapping matched, so a filtered file can be audited.
+    roots: Dict[str, List[str]] = field(default_factory=dict)
+    filtered: bool = False
 
     def __post_init__(self) -> None:
         if VOID_KEY not in self.types:
@@ -271,6 +286,8 @@ class TypeRegistry:
             "geometry": dict(sorted(self.geometry.items())),
             "sources": list(self.sources),
             "conflicts": list(self.conflicts),
+            "filtered": self.filtered,
+            "roots": dict((k, list(v)) for k, v in sorted(self.roots.items())),
             "types": dict((k, v.to_json()) for k, v in sorted(self.types.items())),
         }
 
@@ -292,6 +309,8 @@ class TypeRegistry:
             geometry=dict((k, int(v)) for k, v in (data.get("geometry") or {}).items()),
             sources=list(data.get("sources") or []),
             conflicts=list(data.get("conflicts") or []),
+            roots=dict((k, list(v)) for k, v in (data.get("roots") or {}).items()),
+            filtered=bool(data.get("filtered")),
         )
         for name, node in (data.get("types") or {}).items():
             reg.types[name] = _node_from_json(name, node)

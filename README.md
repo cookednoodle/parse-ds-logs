@@ -35,40 +35,18 @@ A compiler only emits debug info for types a translation unit actually uses. If 
 struct is declared in a header that no compiled code instantiates, add
 `-fno-eliminate-unused-debug-types` so it is emitted anyway.
 
-## 2. Extract the type definitions
-
-```
-dsdecode extract -o types.json build/exe/cpu1/core-cpu1 build/exe/cpu1/cf/*.so
-```
-
-Pass every binary whose messages you want to decode. Include the DS app itself, so the tool
-picks up your `DS_TOTAL_FNAME_BUFSIZE`, and `core-cpu1` for the cFE header types. The command
-prints the header sizes it found:
-
-```
-wrote types.json: 14210 types from 9 file(s)
-  CFE_FS_Header_t                        64 bytes
-  CFE_MSG_CommandHeader_t                8 bytes
-  CFE_MSG_Message_t                      6 bytes
-  CFE_MSG_TelemetryHeader_t              16 bytes
-  DS_FileHeader_t                        76 bytes
-```
-
-Those sizes are how the decoder knows where each packet's payload begins, whether the build
-uses CCSDS version 1 or 2 message IDs, and how long the DS header is. If one is missing, its
-default is used and the command says so.
-
-## 3. Look at a file first
+## 2. Look at a file first
 
 ```
 dsdecode info /path/to/seq001.ds
 ```
 
-This needs no type file. It prints the cFE file header, the DS header, and a count of packets
-per message ID, which is the list you are about to write a mapping for. A close time of zero
-means DS never closed the file cleanly, usually a reset mid-recording.
+This needs no type file, so it is the first thing to run. It prints the cFE file header, the
+DS header, and a count of packets per message ID, which is the list you are about to write a
+mapping for. A close time of zero means DS never closed the file cleanly, usually a reset
+mid-recording.
 
-## 4. Write the message ID mapping
+## 3. Write the message ID mapping
 
 Message IDs are preprocessor macros, and macros leave no trace in debug info, so this one
 file is written by hand:
@@ -112,6 +90,52 @@ typedef struct {
 Mapping a struct that has no cFS message header of its own, a bare payload type, also works:
 the tool notices and decodes it starting after the packet header. See **Limitations** for two
 ways of embedding a header that are not recognized.
+
+## 4. Extract the type definitions
+
+```
+dsdecode extract --mids mids.yaml -o types.json \
+    build/exe/cpu1/core-cpu1 build/exe/cpu1/cf/*.so
+```
+
+Pass every binary whose messages you want to decode. Include the DS app itself, so the tool
+picks up your `DS_TOTAL_FNAME_BUFSIZE`, and `core-cpu1` for the cFE header types.
+
+With `--mids`, the type file holds only the structs your mapping names and the types those are
+built from, which is usually a few dozen entries you can read through rather than the thousands
+a cFS build defines. The command reports what each name in the mapping resolved to, which is
+worth a look: struct lookup is deliberately forgiving about namespaces and case, so this is
+where you confirm it found the type you meant.
+
+```
+wrote types.json: 61 types from 9 file(s)
+  filtered to the 12 struct(s) named in mids.yaml, and what they depend on
+  structs from the mapping:
+    MY_APP_HkTlm_t                     MyApp::HkTlm_t (matched by name without its namespace)
+    MY_APP_DiagTlm_t                   MY_APP_DiagTlm_t
+  header sizes:
+    CFE_FS_Header_t                    64 bytes
+    CFE_MSG_CommandHeader_t            8 bytes
+    CFE_MSG_Message_t                  6 bytes
+    CFE_MSG_TelemetryHeader_t          16 bytes
+    DS_FileHeader_t                    76 bytes
+```
+
+Those header sizes are how the decoder knows where each packet's payload begins, whether the
+build uses CCSDS version 1 or 2 message IDs, and how long the DS header is. They are kept
+whether or not a message struct refers to them. If one is missing, its default is used and the
+command says so.
+
+A struct the mapping names that is not in any of the binaries stops the run, with close names
+suggested, so a typo surfaces here rather than at decode time. Use `--allow-missing` to carry on
+without it, and `-v` to list every type kept.
+
+**Re-run this after adding a message ID to the mapping.** The type file records that it was
+filtered, so if you forget, decode says so and tells you to extract again.
+
+Leaving `--mids` off extracts every type in the binaries. That is the way to go looking for a
+type name when you are first writing a mapping, though `-v` on a filtered run and the suggestions
+in the error message usually get you there.
 
 ## 5. Decode
 

@@ -12,9 +12,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
 from .decode import Options
-from .dictionary import Dictionary, DictionaryError, safe_name
+from .dictionary import (
+    Dictionary,
+    DictionaryError,
+    UnknownStructError,
+    read_mapping,
+    safe_name,
+)
 from .dsfile import HEADER_AUTO, HEADER_CFE, HEADER_NONE, DsFile, DsFileError, Geometry, summarize
-from .dwarf import DwarfError, extract
+from .dwarf import DwarfError, NameFilter, extract
 from .typemodel import GEOMETRY_TYPES, TypeRegistry
 from .writers import make_sink
 
@@ -61,8 +67,26 @@ def _parse_epoch(text: Optional[str]) -> Optional[datetime.datetime]:
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
+    names = None  # type: Optional[NameFilter]
+    wanted = []  # type: List[str]
+    if args.mids:
+        try:
+            mapping = read_mapping(args.mids)
+        except DictionaryError as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            return 1
+        wanted = mapping.struct_names()
+        # The header types are kept too: DS_FileHeader_t and CFE_FS_Header_t
+        # describe the file itself, so no message struct depends on them.
+        names = NameFilter(wanted, always=GEOMETRY_TYPES)
     try:
-        registry = extract(args.elf, verbose=args.verbose, warn=_warn)
+        registry = extract(
+            args.elf,
+            verbose=args.verbose,
+            warn=_warn,
+            names=names,
+            allow_missing=args.allow_missing,
+        )
     except DwarfError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
@@ -75,19 +99,33 @@ def cmd_extract(args: argparse.Namespace) -> int:
         "wrote %s: %d types from %d file(s)"
         % (args.output, len(registry.types), len(registry.sources))
     )
-    missing = [name for name in GEOMETRY_TYPES if name not in registry.geometry]
-    for name in sorted(registry.geometry):
-        print("  %-38s %d bytes" % (name, registry.geometry[name]))
-    if missing:
+    if names is not None:
+        print(
+            "  filtered to the %d struct(s) named in %s, and what they depend on"
+            % (len(wanted), args.mids)
+        )
+        print("  structs from the mapping:")
+        for name in wanted:
+            print("    %-34s %s" % (name, names.describe(name)))
+    if registry.geometry:
+        print("  header sizes:")
+        for name in sorted(registry.geometry):
+            print("    %-34s %d bytes" % (name, registry.geometry[name]))
+    absent = [name for name in GEOMETRY_TYPES if name not in registry.geometry]
+    if absent:
         print(
             "  note: %s not found; defaults are used for those. Add core-cpu1 and "
-            "the DS app to pick them up." % ", ".join(missing)
+            "the DS app to pick them up." % ", ".join(absent)
         )
     if registry.conflicts:
         print(
             "  %d type name(s) have more than one layout in this build; see "
             "'conflicts' in the file." % len(registry.conflicts)
         )
+    if args.verbose:
+        print("  types kept:")
+        for name in sorted(registry.types):
+            print("    %s" % name)
     return 0
 
 
@@ -153,7 +191,14 @@ def cmd_decode(args: argparse.Namespace) -> int:
     try:
         dictionary = Dictionary.load(args.mids, registry, geometry, options, warn=_warn)
     except DictionaryError as exc:
-        print("error: %s" % exc, file=sys.stderr)
+        message = str(exc)
+        if isinstance(exc, UnknownStructError) and registry.filtered:
+            message += (
+                ". %s was extracted for a mapping of %d struct(s), so a message ID "
+                "added since then is not in it; re-run 'dsdecode extract --mids %s'"
+                % (args.types, len(registry.roots), args.mids)
+            )
+        print("error: %s" % message, file=sys.stderr)
         return 1
 
     wanted = None  # type: Optional[set]
@@ -331,7 +376,21 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument(
         "-o", "--output", default="types.json", help="where to write the type file"
     )
-    extract_parser.add_argument("-v", "--verbose", action="store_true")
+    extract_parser.add_argument(
+        "--mids",
+        help=(
+            "message ID mapping; keep only the structs it names and what they "
+            "depend on, instead of every type in the build"
+        ),
+    )
+    extract_parser.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="warn instead of failing when a struct in the mapping is not found",
+    )
+    extract_parser.add_argument(
+        "-v", "--verbose", action="store_true", help="list every type kept"
+    )
     extract_parser.set_defaults(func=cmd_extract)
 
     info_parser = subparsers.add_parser(

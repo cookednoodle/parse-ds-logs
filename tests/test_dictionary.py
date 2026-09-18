@@ -155,3 +155,50 @@ def test_json_is_accepted(tmp_path, registry):
 def test_file_names_stay_safe():
     assert safe_name("SAMPLE/HK MID") == "SAMPLE_HK_MID"
     assert safe_name("../etc/passwd") == ".._etc_passwd"
+
+
+# -- reading a mapping without any types -----------------------------------
+
+
+def test_read_mapping_lists_every_struct_it_names(tmp_path):
+    from dsdecode.dictionary import read_mapping
+
+    path = write_mids(
+        tmp_path,
+        "mids:\n"
+        "  A: {value: 0x0890, struct: sample::HkTlm_t}\n"
+        "  0x0891: GLOBAL_Tlm_t\n"
+        "  C:\n"
+        "    value: 0x1882\n"
+        "    struct:\n"
+        "      default: sample::NoopCmd_t\n"
+        "      fcn: {1: sample::SetModeCmd_t, 2: sample::NoopCmd_t}\n",
+    )
+    mapping = read_mapping(path)
+    assert len(mapping) == 3
+    # File order, and a struct named twice is listed once.
+    assert mapping.struct_names() == [
+        "sample::HkTlm_t",
+        "GLOBAL_Tlm_t",
+        "sample::NoopCmd_t",
+        "sample::SetModeCmd_t",
+    ]
+
+
+def test_read_mapping_checks_the_file_with_no_types_to_hand(tmp_path):
+    from dsdecode.dictionary import read_mapping
+
+    with pytest.raises(DictionaryError) as caught:
+        read_mapping(write_mids(tmp_path, "mids:\n  SOME_MID: {struct: Whatever_t}\n"))
+    assert "no message ID" in str(caught.value)
+
+
+def test_read_mapping_and_dictionary_load_agree_on_a_bad_file(tmp_path, registry):
+    from dsdecode.dictionary import read_mapping
+
+    path = write_mids(tmp_path, "mids: {}\n")
+    with pytest.raises(DictionaryError) as from_read:
+        read_mapping(path)
+    with pytest.raises(DictionaryError) as from_load:
+        Dictionary.load(path, registry, Geometry.from_registry(registry))
+    assert str(from_read.value) == str(from_load.value)

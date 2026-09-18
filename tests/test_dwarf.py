@@ -146,3 +146,89 @@ def test_file_without_debug_info_is_reported(tmp_path):
     plain.write_bytes(b"not an elf file at all")
     with pytest.raises(DwarfError):
         extract([str(plain)])
+
+
+# -- filtering to a mapping ------------------------------------------------
+
+
+def filtered(so, names, **kwargs):
+    """Extract only the named structs, as 'dsdecode extract --mids' does."""
+    from dsdecode.dwarf import NameFilter, extract
+    from dsdecode.typemodel import GEOMETRY_TYPES
+
+    return extract([so], names=NameFilter(names, always=GEOMETRY_TYPES), **kwargs)
+
+
+def test_filtering_keeps_the_named_struct_and_what_it_depends_on(fixture_so):
+    reg = filtered(fixture_so, ["sample::HkTlm_t"])
+    assert reg.filtered
+    assert "sample::HkTlm_t" in reg.types
+    for dependency in (
+        "sample::HkPayload",
+        "sample::Vec3",
+        "sample::Flags",
+        "sample::Mode_t",
+        "CFE_MSG_TelemetryHeader_t",
+        "char[12]",
+        "int32[2][3]",
+        "uint64",
+    ):
+        assert dependency in reg.types, "%s should have been pulled in" % dependency
+
+
+def test_filtering_drops_types_nothing_mapped_needs(fixture_so):
+    reg = filtered(fixture_so, ["sample::HkTlm_t"])
+    for unrelated in ("sample::UnionTlm_t", "ANON_Tlm_t", "GLOBAL_Tlm_t", "sample::Value_t"):
+        assert unrelated not in reg.types, "%s should have been left out" % unrelated
+
+
+def test_filtering_leaves_far_less_to_read(fixture_so):
+    from dsdecode.dwarf import extract
+
+    full = extract([fixture_so])
+    small = filtered(fixture_so, ["sample::HkTlm_t"])
+    assert len(small.types) * 3 < len(full.types)
+
+
+def test_geometry_types_survive_filtering(fixture_so):
+    # Nothing a message struct contains refers to these two, but the decoder
+    # needs their sizes to read a DS file at all.
+    reg = filtered(fixture_so, ["sample::HkTlm_t"])
+    assert reg.geometry["DS_FileHeader_t"] == 76
+    assert reg.geometry["CFE_FS_Header_t"] == 64
+    assert "DS_FileHeader_t" in reg.types
+
+
+def test_filtering_records_what_each_mapping_name_resolved_to(fixture_so):
+    reg = filtered(fixture_so, ["HkTlm_t"])
+    assert reg.roots == {"HkTlm_t": ["sample::HkTlm_t"]}
+    assert "DS_FileHeader_t" not in reg.roots, "geometry types are not mapping names"
+
+
+def test_filtering_resolves_a_name_ignoring_case(fixture_so):
+    reg = filtered(fixture_so, ["hktlm_t"])
+    assert reg.roots == {"hktlm_t": ["sample::HkTlm_t"]}
+
+
+def test_a_struct_that_is_not_in_the_build_stops_extraction(fixture_so):
+    from dsdecode.dwarf import DwarfError
+
+    with pytest.raises(DwarfError) as caught:
+        filtered(fixture_so, ["sample::HkTlm_t", "sample::HkTlmX_t"])
+    message = str(caught.value)
+    assert "sample::HkTlmX_t" in message
+    assert "HkTlm_t" in message, "the error should suggest a close name"
+
+
+def test_allow_missing_warns_and_carries_on(fixture_so):
+    warnings = []
+    reg = filtered(
+        fixture_so, ["sample::HkTlm_t", "Nope_t"], allow_missing=True, warn=warnings.append
+    )
+    assert any("Nope_t" in w for w in warnings)
+    assert reg.roots == {"sample::HkTlm_t": ["sample::HkTlm_t"]}
+
+
+def test_unfiltered_extraction_is_unchanged(registry):
+    assert not registry.filtered
+    assert registry.roots == {}
