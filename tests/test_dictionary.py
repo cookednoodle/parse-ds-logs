@@ -445,3 +445,34 @@ def test_loading_a_generated_map_warns_about_what_it_skipped(tmp_path, registry)
         path, registry, Geometry.from_registry(registry), warn=warnings.append
     )
     assert any("CTRL_APP_DIAG_TLM_MID" in w and "skipped" in w for w in warnings)
+
+
+def test_a_dropped_column_is_warned_about_when_the_mapping_loads(tmp_path, registry):
+    """A type file with a hole in it says so, rather than a short CSV."""
+    from dsdecode.typemodel import Member, StructType, TypeRegistry
+
+    types = dict(registry.types)
+    types["Holey_t"] = StructType(
+        "Holey_t",
+        24,
+        [
+            Member("TelemetryHeader", 0, "CFE_MSG_TelemetryHeader_t"),
+            Member("Good", 16, "uint32"),
+            Member("Lost", 20, "NotInTheFile_t"),
+        ],
+    )
+    broken = TypeRegistry(
+        types=types,
+        endian=registry.endian,
+        pointer_size=registry.pointer_size,
+        geometry=dict(registry.geometry),
+    )
+    warnings = []
+    mids = Dictionary.load(
+        write_mids(tmp_path, "mids:\n  HK: {value: 0x0890, struct: Holey_t}\n"),
+        broken,
+        Geometry.from_registry(broken),
+        warn=warnings.append,
+    )
+    assert mids.lookup(0x0890).decoder_for(None).columns == ["Good"]
+    assert any("Lost" in w and "NotInTheFile_t" in w for w in warnings)

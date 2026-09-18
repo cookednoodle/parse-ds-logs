@@ -227,6 +227,17 @@ A packet shorter than its struct still produces a row, with the fields that ran 
 left empty. Packet counts, unmapped IDs and short packets are all summarized on stderr when
 the run finishes.
 
+A field that cannot be given a column is reported rather than passed over, because a missing
+column looks exactly like a field the message never had:
+
+```
+warning: MY_APP_HkTlm_t: no column for Payload.Position (its type 'MyApp::Vec3' is not in the type file)
+```
+
+That usually means the type file is missing something the message depends on, so extract again.
+A flexible array member is reported the same way and for the same reason, though there is
+nothing to fix: its length comes from the packet, so it has no fixed columns.
+
 ## What the file format is
 
 With the default `DS_FILE_HEADER_TYPE` of `DS_FILE_HEADER_CFE`, a DS file is:

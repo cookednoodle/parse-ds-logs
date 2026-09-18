@@ -133,3 +133,135 @@ def test_unknown_type_is_reported(registry):
 def test_a_scalar_type_is_rejected(registry):
     with pytest.raises(DecodeError):
         compile_struct(registry, "uint32")
+
+
+# -- fields that get no column ---------------------------------------------
+
+
+def awkward(registry, members, extra=None, size=32, options=None):
+    """Compile a message struct built to be awkward, and collect the warnings.
+
+    Everything happens against a copy, because the registry fixture is shared
+    by the whole session and a test that dirties it would break its neighbours.
+    """
+    from dsdecode.typemodel import Member, StructType, TypeRegistry
+
+    types = dict(registry.types)
+    types.update(extra or {})
+    types["Awkward_t"] = StructType(
+        "Awkward_t",
+        size,
+        [Member("TelemetryHeader", 0, "CFE_MSG_TelemetryHeader_t")] + list(members),
+    )
+    copy = TypeRegistry(
+        types=types,
+        endian=registry.endian,
+        pointer_size=registry.pointer_size,
+        geometry=dict(registry.geometry),
+    )
+    warnings = []
+    decoder = compile_struct(copy, "Awkward_t", options, warn=warnings.append)
+    return decoder, warnings
+
+
+def test_a_member_whose_type_is_missing_says_so_and_keeps_the_rest(registry):
+    from dsdecode.typemodel import Member
+
+    decoder, warnings = awkward(
+        registry,
+        [
+            Member("Before", 16, "uint32"),
+            Member("Missing", 20, "NotInTheFile_t"),
+            Member("After", 24, "uint32"),
+        ],
+    )
+    # The fields around the hole still decode.
+    assert decoder.columns == ["Before", "After"]
+    assert len(warnings) == 1
+    assert "Missing" in warnings[0]
+    assert "NotInTheFile_t" in warnings[0]
+    assert "not in the type file" in warnings[0]
+    assert "Awkward_t" in warnings[0]
+
+
+def test_fields_sharing_one_missing_type_are_reported_together(registry):
+    from dsdecode.typemodel import Member
+
+    decoder, warnings = awkward(
+        registry,
+        [
+            Member("First", 16, "NotInTheFile_t"),
+            Member("Second", 20, "NotInTheFile_t"),
+            Member("Third", 24, "NotInTheFile_t"),
+        ],
+    )
+    assert decoder.columns == []
+    assert len(warnings) == 1, "one cause should be one line, not one per field"
+    for name in ("First", "Second", "Third"):
+        assert name in warnings[0]
+
+
+def test_a_flexible_array_says_why_it_has_no_columns(registry):
+    from dsdecode.typemodel import ArrayType, Member
+
+    decoder, warnings = awkward(
+        registry,
+        [Member("Count", 16, "uint32"), Member("Data", 20, "uint8[0]")],
+        extra={"uint8[0]": ArrayType("uint8[0]", "uint8", [0], 0)},
+    )
+    assert decoder.columns == ["Count"]
+    assert len(warnings) == 1
+    assert "Data" in warnings[0]
+    assert "flexible array" in warnings[0]
+
+
+def test_a_member_the_debug_info_could_not_type_is_reported(registry):
+    from dsdecode.typemodel import Member
+
+    decoder, warnings = awkward(registry, [Member("Callback", 16, "void")])
+    assert decoder.columns == []
+    assert len(warnings) == 1
+    assert "Callback" in warnings[0]
+    assert "debug info" in warnings[0]
+
+
+def test_an_array_whose_element_type_is_missing_is_reported(registry):
+    from dsdecode.typemodel import ArrayType, Member
+
+    decoder, warnings = awkward(
+        registry,
+        [Member("Items", 16, "Gone_t[4]")],
+        extra={"Gone_t[4]": ArrayType("Gone_t[4]", "Gone_t", [4], 16)},
+    )
+    assert decoder.columns == []
+    assert len(warnings) == 1
+    assert "Items" in warnings[0]
+    assert "Gone_t" in warnings[0]
+
+
+def test_nesting_past_the_depth_limit_is_reported(registry):
+    warnings = []
+    decoder = compile_struct(
+        registry, "sample::HkTlm_t", Options(max_depth=1), warn=warnings.append
+    )
+    assert decoder.columns == []
+    assert len(warnings) == 1
+    assert "nested deeper than 1 levels" in warnings[0]
+    # A long list is cut short rather than filling the terminal.
+    assert "and" in warnings[0] and "more" in warnings[0]
+
+
+def test_every_type_in_the_build_compiles_without_a_warning(registry):
+    """The guard that keeps these warnings from becoming noise."""
+    from dsdecode.typemodel import KIND_STRUCT, KIND_UNION
+
+    warnings = []
+    names = [
+        name
+        for name, node in registry.types.items()
+        if node.kind in (KIND_STRUCT, KIND_UNION)
+    ]
+    assert len(names) > 30, "the fixture should offer plenty to compile"
+    for name in names:
+        compile_struct(registry, name, warn=warnings.append)
+    assert warnings == []

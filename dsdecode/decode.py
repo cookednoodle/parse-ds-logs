@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import itertools
 import struct
+import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .typemodel import (
@@ -25,6 +26,7 @@ from .typemodel import (
     KIND_POINTER,
     KIND_STRUCT,
     KIND_UNION,
+    VOID_KEY,
     TypeRegistry,
 )
 
@@ -55,6 +57,13 @@ _UINT_FORMATS = {1: "B", 2: "H", 4: "I", 8: "Q"}
 _FLOAT_FORMATS = {4: "f", 8: "d"}
 
 MAX_DEPTH = 32
+
+# How many dropped column names to list before saying "and N more".
+_MAX_LISTED = 6
+
+
+def _default_warn(message: str) -> None:
+    print("warning: %s" % message, file=sys.stderr)
 
 
 class DecodeError(Exception):
@@ -236,17 +245,26 @@ class Decoder(object):
 
 
 def compile_struct(
-    registry: TypeRegistry, type_key: str, options: Optional[Options] = None
+    registry: TypeRegistry,
+    type_key: str,
+    options: Optional[Options] = None,
+    warn: Optional[Any] = None,
 ) -> Decoder:
-    """Flatten ``type_key`` into the columns and fields of a decoder."""
+    """Flatten ``type_key`` into the columns and fields of a decoder.
+
+    A field the type file cannot describe gets no column.  That is reported
+    through ``warn`` rather than passing quietly, because a missing column
+    looks exactly like a field the message never had.
+    """
     options = options or Options()
     node = registry.resolve(type_key)
     if node is None:
         raise DecodeError("type %r is not in the type file" % type_key)
     if node.kind not in (KIND_STRUCT, KIND_UNION):
         raise DecodeError("type %r is a %s, not a struct" % (type_key, node.kind))
-    builder = _Builder(registry, options)
+    builder = _Builder(registry, options, type_key)
     header_size = builder.walk_top(node)
+    builder.report(warn)
     fields = builder.fields
     return Decoder(
         type_name=type_key,
@@ -258,12 +276,32 @@ def compile_struct(
 
 
 class _Builder(object):
-    def __init__(self, registry: TypeRegistry, options: Options) -> None:
+    def __init__(self, registry: TypeRegistry, options: Options, type_name: str = "") -> None:
         self.registry = registry
         self.options = options
+        self.type_name = type_name
         self.fields = []  # type: List[_Field]
         self.prefix_char = ">" if registry.endian == "big" else "<"
         self._used = {}  # type: Dict[str, int]
+        # Why each field was left out, in the order the reasons first came up.
+        self.dropped = {}  # type: Dict[str, List[str]]
+
+    # -- fields with no column -------------------------------------------
+
+    def drop(self, column: str, reason: str) -> None:
+        """Note a field that will have no column, and why."""
+        self.dropped.setdefault(reason, []).append(column or "(unnamed)")
+
+    def report(self, warn: Optional[Any] = None) -> None:
+        """Say what was left out, one line per cause rather than per field."""
+        if not self.dropped:
+            return
+        say = warn or _default_warn
+        for reason, columns in self.dropped.items():
+            shown = ", ".join(columns[:_MAX_LISTED])
+            if len(columns) > _MAX_LISTED:
+                shown += ", and %d more" % (len(columns) - _MAX_LISTED)
+            say("%s: no column for %s (%s)" % (self.type_name, shown, reason))
 
     # -- helpers ---------------------------------------------------------
 
@@ -327,9 +365,11 @@ class _Builder(object):
 
     def _walk_type(self, type_key: str, column: str, offset: int, depth: int) -> None:
         if depth > self.options.max_depth:
+            self.drop(column, "it is nested deeper than %d levels" % self.options.max_depth)
             return
         node = self.registry.resolve(type_key)
         if node is None:
+            self.drop(column, "its type %r is not in the type file" % type_key)
             return
         kind = node.kind
         if kind in (KIND_STRUCT, KIND_UNION):
@@ -359,6 +399,10 @@ class _Builder(object):
         # A base type.
         size = getattr(node, "size", 0)
         if not size:
+            if node.name == VOID_KEY:
+                self.drop(column, "the debug info did not record its type")
+            else:
+                self.drop(column, "its type %r has no size" % node.name)
             return
         encoding = getattr(node, "encoding", ENC_UINT)
         if encoding == ENC_CHAR and size == 1:
@@ -377,12 +421,17 @@ class _Builder(object):
         for dim in dims:
             total *= dim
         if total <= 0:
-            return  # flexible array member: no storage of its own
+            # A flexible array member has no storage of its own, and no fixed
+            # number of columns either: its length comes from the packet.
+            self.drop(column, "it is a flexible array, whose length varies per packet")
+            return
         elem = self.registry.resolve(node.elem)
         if elem is None:
+            self.drop(column, "its array element type %r is not in the type file" % node.elem)
             return
         elem_size = getattr(elem, "size", 0) or 0
         if elem_size <= 0:
+            self.drop(column, "its array element type %r has no size" % elem.name)
             return
         encoding = getattr(elem, "encoding", None)
 

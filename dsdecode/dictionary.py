@@ -347,7 +347,7 @@ class Dictionary(object):
         index = _NameIndex(registry)
         options = options or Options()
         for entry in mapping.entries:
-            _compile_entry(entry, index, options, registry)
+            _compile_entry(entry, index, options, registry, warn)
             existing = dictionary.entries.get(entry.value)
             if existing is not None:
                 warn(
@@ -418,23 +418,34 @@ def _read_entry(key: Any, value: Any) -> MidEntry:
 
 
 def _compile_entry(
-    entry: MidEntry, index: "_NameIndex", options: Options, registry: TypeRegistry
+    entry: MidEntry,
+    index: "_NameIndex",
+    options: Options,
+    registry: TypeRegistry,
+    warn: Optional[Any] = None,
 ) -> None:
     """Attach a decoder to an entry for each struct it names."""
     if entry.default_struct is not None:
         entry.decoders[None] = _compile(
-            entry.default_struct, index, options, registry, entry.name
+            entry.default_struct, index, options, registry, entry.name, warn
         )
     for code, struct_name in entry.by_fcn.items():
-        entry.decoders[code] = _compile(struct_name, index, options, registry, entry.name)
+        entry.decoders[code] = _compile(
+            struct_name, index, options, registry, entry.name, warn
+        )
 
 
 def _compile(
-    struct_name: str, index: "_NameIndex", options: Options, registry: TypeRegistry, mid_name: str
+    struct_name: str,
+    index: "_NameIndex",
+    options: Options,
+    registry: TypeRegistry,
+    mid_name: str,
+    warn: Optional[Any] = None,
 ) -> Decoder:
     resolved = index.resolve(struct_name)
     try:
-        return compile_struct(registry, resolved, options)
+        return compile_struct(registry, resolved, options, warn=warn)
     except DecodeError as exc:
         raise DictionaryError("%s: %s" % (mid_name, exc))
 
