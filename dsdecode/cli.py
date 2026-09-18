@@ -11,7 +11,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
-from .decode import Options
+from .decode import UNION_BYTES_DROP, UNION_BYTES_KEEP, Options
 from .dictionary import (
     Dictionary,
     DictionaryError,
@@ -250,6 +250,7 @@ def cmd_decode(args: argparse.Namespace) -> int:
         char_arrays=args.char_arrays,
         enum_values=args.enum_values,
         header_types=_declared_headers(args),
+        union_bytes=args.union_bytes,
     )
     try:
         dictionary = Dictionary.load(args.mids, registry, geometry, options, warn=_warn)
@@ -490,6 +491,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     decode_parser.add_argument(
         "--enum-values", action="store_true", help="report enums as numbers, not names"
+    )
+    decode_parser.add_argument(
+        "--union-bytes",
+        choices=(UNION_BYTES_KEEP, UNION_BYTES_DROP),
+        default=UNION_BYTES_KEEP,
+        help=(
+            "whether a union member that is only a byte array view of the same "
+            "storage gets columns (default: keep); 'unions' in the mapping "
+            "overrides this per type"
+        ),
     )
     _add_header_type_arg(decode_parser)
     decode_parser.add_argument(

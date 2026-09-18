@@ -6,6 +6,13 @@ handful of ``unpack_from`` calls, which matters when a log holds millions of
 them.  Nested structs, arrays, bitfields and unions all flatten into columns
 named after the path taken to reach them, so every row of a CSV has the same
 shape.
+
+A union gets a column per member by default, each decoded from the same
+bytes.  A mapping can say how a union is really used instead: which members
+are views worth keeping, or which member holds an identifier that says what
+the rest of the bytes are.  A tagged union still has every alternative's
+columns, so the row shape stays fixed, but only the alternative the
+identifier names is filled in.
 """
 
 from __future__ import annotations
@@ -22,11 +29,13 @@ from .typemodel import (
     ENC_INT,
     ENC_UINT,
     KIND_ARRAY,
+    KIND_BASE,
     KIND_ENUM,
     KIND_POINTER,
     KIND_STRUCT,
     KIND_UNION,
     VOID_KEY,
+    Member,
     TypeRegistry,
 )
 
@@ -70,10 +79,52 @@ class DecodeError(Exception):
     """Raised when a type cannot be turned into a set of columns."""
 
 
+UNION_BYTES_KEEP = "keep"
+UNION_BYTES_DROP = "drop"
+
+
+class UnionUse(object):
+    """How one union type is used, as declared in a mapping.
+
+    Either a choice of members, when the union is several views of the same
+    bytes: ``keep`` names the members that get columns, or ``drop`` the ones
+    that do not.  Or a tag: ``tag`` is the path to the member holding an
+    identifier, and ``cases`` says which member the bytes are when the
+    identifier has each value.  Case keys are the identifier's values, or
+    enumerator names when it is an enum.  Members a tagged union does not
+    name in ``keep`` or ``cases`` get no columns.
+    """
+
+    __slots__ = ("keep", "drop", "tag", "cases")
+
+    def __init__(
+        self,
+        keep: Optional[Sequence[str]] = None,
+        drop: Optional[Sequence[str]] = None,
+        tag: Optional[str] = None,
+        cases: Optional[Dict[Any, str]] = None,
+    ) -> None:
+        self.keep = list(keep) if keep is not None else None
+        self.drop = list(drop) if drop is not None else None
+        self.tag = tag
+        self.cases = dict(cases or {})
+
+    @property
+    def tagged(self) -> bool:
+        return self.tag is not None
+
+
 class Options:
     """Knobs that change how values are rendered."""
 
-    __slots__ = ("char_arrays", "enum_values", "max_depth", "header_types")
+    __slots__ = (
+        "char_arrays",
+        "enum_values",
+        "max_depth",
+        "header_types",
+        "unions",
+        "union_bytes",
+    )
 
     def __init__(
         self,
@@ -81,6 +132,8 @@ class Options:
         enum_values: bool = False,
         max_depth: int = MAX_DEPTH,
         header_types: Optional[Any] = None,
+        unions: Optional[Dict[str, UnionUse]] = None,
+        union_bytes: str = UNION_BYTES_KEEP,
     ) -> None:
         self.char_arrays = char_arrays
         self.enum_values = enum_values
@@ -89,6 +142,17 @@ class Options:
         # defines its own.  A typedef of a declared type counts too, since the
         # chain is followed.
         self.header_types = frozenset(header_types or ())
+        # How particular unions are used, keyed by the union's registry name.
+        self.unions = dict(unions or {})
+        # What to do with a union member that is only a byte array view of
+        # the same storage, in a union no entry above describes.
+        self.union_bytes = union_bytes
+
+    def replace(self, **changes: Any) -> "Options":
+        """A copy with some settings changed."""
+        values = dict((name, getattr(self, name)) for name in self.__slots__)
+        values.update(changes)
+        return Options(**values)
 
 
 class _Field(object):
@@ -101,7 +165,8 @@ class _Field(object):
         self.offset = offset
         self.width = width
 
-    def read(self, data: bytes, base: int) -> Sequence[Any]:
+    def read(self, data: bytes, base: int, limit: int) -> Sequence[Any]:
+        """Values for every column, given that the field lies within ``limit``."""
         raise NotImplementedError
 
 
@@ -121,7 +186,7 @@ class _Scalar(_Field):
         self.kind = kind
         self.enum_map = enum_map
 
-    def read(self, data: bytes, base: int) -> Sequence[Any]:
+    def read(self, data: bytes, base: int, limit: int) -> Sequence[Any]:
         value = self.codec.unpack_from(data, base + self.offset)[0]
         if self.kind == ENC_BOOL:
             return (1 if value else 0,)
@@ -150,7 +215,7 @@ class _Vector(_Field):
         self.kind = kind
         self.enum_map = enum_map
 
-    def read(self, data: bytes, base: int) -> Sequence[Any]:
+    def read(self, data: bytes, base: int, limit: int) -> Sequence[Any]:
         values = self.codec.unpack_from(data, base + self.offset)
         if self.kind == ENC_BOOL:
             return [1 if v else 0 for v in values]
@@ -166,7 +231,7 @@ class _Chars(_Field):
 
     __slots__ = ()
 
-    def read(self, data: bytes, base: int) -> Sequence[Any]:
+    def read(self, data: bytes, base: int, limit: int) -> Sequence[Any]:
         start = base + self.offset
         raw = data[start : start + self.width]
         end = raw.find(b"\x00")
@@ -192,7 +257,7 @@ class _Bits(_Field):
         self.bit_size = bit_size
         self.signed = signed
 
-    def read(self, data: bytes, base: int) -> Sequence[Any]:
+    def read(self, data: bytes, base: int, limit: int) -> Sequence[Any]:
         start = base + self.offset
         raw = data[start : start + self.width]
         whole = int.from_bytes(raw, "little")
@@ -207,9 +272,63 @@ class _Raw(_Field):
 
     __slots__ = ()
 
-    def read(self, data: bytes, base: int) -> Sequence[Any]:
+    def read(self, data: bytes, base: int, limit: int) -> Sequence[Any]:
         start = base + self.offset
         return (data[start : start + self.width].hex(),)
+
+
+class _Switch(_Field):
+    """A tagged union: one alternative's fields, chosen by an identifier.
+
+    The columns are every alternative's columns, one after another, so a row
+    always has the same shape.  Reading fills the alternative the identifier
+    names and leaves the others empty.  An identifier with no case leaves
+    them all empty; the identifier's own column, read separately, says which
+    value that was.
+    """
+
+    __slots__ = ("tag", "cases", "slots", "blank")
+
+    def __init__(
+        self,
+        tag: _Field,
+        alternatives: List[Tuple[List[int], List[_Field]]],
+    ) -> None:
+        # The tag's offset and width stand for the whole field: with the tag
+        # unreadable, nothing else can be interpreted.
+        _Field.__init__(self, [], tag.offset, tag.width)
+        self.tag = tag
+        self.cases = {}  # type: Dict[int, List[_Field]]
+        self.slots = {}  # type: Dict[int, int]
+        for values, fields in alternatives:
+            start = len(self.names)
+            for field in fields:
+                self.names.extend(field.names)
+            for value in values:
+                self.cases[value] = fields
+                self.slots[value] = start
+        self.blank = [None] * len(self.names)  # type: List[Any]
+
+    def read(self, data: bytes, base: int, limit: int) -> Sequence[Any]:
+        value = self.tag.read(data, base, limit)[0]
+        fields = self.cases.get(value)
+        if fields is None:
+            return self.blank
+        values = _read_fields(fields, data, base, limit)
+        start = self.slots[value]
+        return self.blank[:start] + values + self.blank[start + len(values) :]
+
+
+def _read_fields(fields: Sequence[_Field], data: bytes, base: int, limit: int) -> List[Any]:
+    """Read every field, with those past ``limit`` coming back as None."""
+    row = []  # type: List[Any]
+    for field in fields:
+        start = base + field.offset
+        if start + field.width > limit:
+            row.extend([None] * len(field.names))
+        else:
+            row.extend(field.read(data, base, limit))
+    return row
 
 
 class Decoder(object):
@@ -242,14 +361,7 @@ class Decoder(object):
         """
         if limit is None:
             limit = len(data)
-        row = []  # type: List[Any]
-        for field in self.fields:
-            start = base + field.offset
-            if start + field.width > limit:
-                row.extend([None] * len(field.names))
-            else:
-                row.extend(field.read(data, base))
-        return row
+        return _read_fields(self.fields, data, base, limit)
 
 
 def compile_struct(
@@ -301,6 +413,8 @@ class _Builder(object):
         self._known_headers = HEADER_TYPES | options.header_types
         # Why each field was left out, in the order the reasons first came up.
         self.dropped = {}  # type: Dict[str, List[str]]
+        # A tagged union's plan is worked out once, however many times it is met.
+        self._plans = {}  # type: Dict[str, _TagPlan]
 
     # -- fields with no column -------------------------------------------
 
@@ -394,7 +508,10 @@ class _Builder(object):
             self.drop(column, "its type %r is not in the type file" % type_key)
             return
         kind = node.kind
-        if kind in (KIND_STRUCT, KIND_UNION):
+        if kind == KIND_UNION:
+            self._walk_union(node, column, offset, depth)
+            return
+        if kind == KIND_STRUCT:
             for member in node.members:
                 self._walk_member(member, column, offset, depth + 1)
             return
@@ -436,6 +553,73 @@ class _Builder(object):
             return
         codec = struct.Struct(self.prefix_char + fmt)
         self.fields.append(_Scalar(self._unique(column), offset, codec, encoding))
+
+    # -- unions ----------------------------------------------------------
+
+    def _walk_union(self, node: Any, column: str, offset: int, depth: int) -> None:
+        use = self.options.unions.get(node.name)
+        if use is not None and use.tagged:
+            self._walk_tagged(node, use, column, offset, depth)
+            return
+        for member in _union_members(node, use, self.registry, self.options.union_bytes):
+            self._walk_member(member, column, offset, depth + 1)
+
+    def _walk_tagged(self, node: Any, use: UnionUse, column: str, offset: int, depth: int) -> None:
+        plan = self._plans.get(node.name)
+        if plan is None:
+            plan = plan_union(self.registry, node, use)
+            self._plans[node.name] = plan
+        # The identifier, and anything else the mapping says is always there.
+        for member in plan.always:
+            self._walk_member(member, column, offset, depth + 1)
+        tag = self._tag_field(plan, offset)
+        if tag is None:
+            self.drop(
+                _join(column, use.tag),
+                "its identifier type %r is not a scalar the decoder can read" % plan.tag_type,
+            )
+            return
+        alternatives = []  # type: List[Tuple[List[int], List[_Field]]]
+        for member, values in plan.alternatives:
+            fields = self._collect(member, column, offset, depth + 1)
+            # Every alternative begins with the identifier, which has its own
+            # column above; the copy inside each one is not repeated.
+            fields = [f for f in fields if not plan.inside_identifier(f.offset - offset, f.width)]
+            alternatives.append((values, fields))
+        self.fields.append(_Switch(tag, alternatives))
+
+    def _collect(self, member: Any, prefix: str, base: int, depth: int) -> List[_Field]:
+        """Walk one member into a list of its own, leaving ``self.fields`` alone."""
+        outer = self.fields
+        self.fields = []
+        try:
+            self._walk_member(member, prefix, base, depth)
+            return self.fields
+        finally:
+            self.fields = outer
+
+    def _tag_field(self, plan: "_TagPlan", offset: int) -> Optional[_Field]:
+        """A reader for the identifier, always as a number."""
+        tag = plan.tag
+        node = self.registry.resolve(tag.type)
+        if node is None:
+            return None
+        if tag.bit_size is not None:
+            signed = getattr(node, "encoding", ENC_UINT) == ENC_INT
+            bit_offset = tag.bit_offset if tag.bit_offset is not None else tag.offset * 8
+            return _Bits("", bit_offset + offset * 8, tag.bit_size, signed)
+        if node.kind == KIND_ENUM:
+            fmt = self._format(node.encoding, node.size)
+        elif node.kind == KIND_BASE:
+            if node.encoding not in (ENC_INT, ENC_UINT, ENC_BOOL, ENC_CHAR):
+                return None
+            fmt = self._format(node.encoding, node.size)
+        else:
+            return None
+        if fmt is None:
+            return None
+        codec = struct.Struct(self.prefix_char + fmt)
+        return _Scalar("", offset + tag.offset, codec, ENC_UINT)
 
     def _walk_array(self, node: Any, column: str, offset: int, depth: int) -> None:
         dims = [d for d in node.dims]
@@ -520,3 +704,239 @@ class _Builder(object):
 
 def _indices(dims: Sequence[int]) -> Iterable[Tuple[int, ...]]:
     return itertools.product(*[range(d) for d in dims])
+
+
+def _join(prefix: str, name: str) -> str:
+    return "%s.%s" % (prefix, name) if prefix and name else prefix or name
+
+
+# -- how a union is used -------------------------------------------------
+
+
+def _member_names(node: Any) -> List[str]:
+    return [m.name for m in node.members if m.name]
+
+
+def _check_member_names(node: Any, names: Sequence[str], what: str) -> None:
+    known = _member_names(node)
+    for name in names:
+        if name not in known:
+            raise DecodeError(
+                "union %s has no member %r (named under %s); its members are %s"
+                % (node.name, name, what, ", ".join(known) or "unnamed")
+            )
+
+
+def is_byte_view(registry: TypeRegistry, type_key: str) -> bool:
+    """Whether a member is an array of bytes: storage seen a byte at a time."""
+    node = registry.resolve(type_key)
+    if node is None or node.kind != KIND_ARRAY:
+        return False
+    elem = registry.resolve(node.elem)
+    return (
+        elem is not None
+        and elem.kind == KIND_BASE
+        and elem.size == 1
+        and elem.encoding in (ENC_INT, ENC_UINT)
+    )
+
+
+def check_union_use(registry: TypeRegistry, node: Any, use: UnionUse) -> None:
+    """Judge a declaration against the union it describes.
+
+    Raises :class:`DecodeError` naming the mistake.  Done when a mapping is
+    loaded, so a wrong member name is caught with the file to blame rather
+    than the first message that happens to hold the union.
+    """
+    if node.kind != KIND_UNION:
+        raise DecodeError("%s is a %s, not a union" % (node.name, node.kind))
+    if use.tagged:
+        plan_union(registry, node, use)
+        return
+    if use.keep is not None:
+        _check_member_names(node, use.keep, "keep")
+    if use.drop is not None:
+        _check_member_names(node, use.drop, "drop")
+
+
+def _union_members(
+    node: Any, use: Optional[UnionUse], registry: TypeRegistry, union_bytes: str
+) -> List[Any]:
+    """The members of an untagged union that get columns."""
+    if use is not None:
+        if use.keep is not None:
+            _check_member_names(node, use.keep, "keep")
+            return [m for m in node.members if m.name in use.keep]
+        if use.drop is not None:
+            _check_member_names(node, use.drop, "drop")
+            return [m for m in node.members if m.name not in use.drop]
+        return list(node.members)
+    if union_bytes == UNION_BYTES_DROP:
+        kept = [m for m in node.members if not is_byte_view(registry, m.type)]
+        # A union that is nothing but byte views is left as it is.
+        if kept:
+            return kept
+    return list(node.members)
+
+
+class _TagPlan(object):
+    """A tagged union worked out against the registry.
+
+    ``tag`` is the member holding the identifier, with its offset made
+    relative to the union.  ``always`` are the members decoded whatever the
+    identifier says: the one the tag path starts at, and any the mapping
+    lists under ``keep``.  ``alternatives`` pairs each member named in
+    ``cases`` with the identifier values that select it.
+    """
+
+    __slots__ = ("tag", "tag_type", "identifier", "always", "alternatives")
+
+    def __init__(
+        self,
+        tag: Any,
+        tag_type: str,
+        identifier: Any,
+        always: List[Any],
+        alternatives: List[Tuple[Any, List[int]]],
+    ) -> None:
+        self.tag = tag
+        self.tag_type = tag_type
+        self.identifier = identifier
+        self.always = always
+        self.alternatives = alternatives
+
+    def inside_identifier(self, offset: int, width: int) -> bool:
+        """Whether a field of an alternative lies within the identifier member."""
+        start = self.identifier[0]
+        end = start + self.identifier[1]
+        return offset >= start and offset + width <= end
+
+
+def plan_union(registry: TypeRegistry, node: Any, use: UnionUse) -> _TagPlan:
+    """Check a tagged union's declaration against the type and lay out its use.
+
+    Raises :class:`DecodeError` with the mistake spelled out, so a mapping is
+    judged when it is loaded rather than when a packet turns up.
+    """
+    if node.kind != KIND_UNION:
+        raise DecodeError("%s is a %s, not a union" % (node.name, node.kind))
+    path = [part for part in (use.tag or "").split(".") if part]
+    if not path:
+        raise DecodeError("union %s: 'tag' names no member" % node.name)
+    _check_member_names(node, path[:1], "tag")
+    identifier = next(m for m in node.members if m.name == path[0])
+    tag, tag_type = _follow(registry, node, identifier, path)
+    ident_size = registry.sizeof(identifier.type) or 0
+
+    keep = list(use.keep or [])
+    _check_member_names(node, keep, "keep")
+    if use.drop:
+        raise DecodeError(
+            "union %s: 'drop' cannot go with 'tag'; members not named in "
+            "'cases' or 'keep' already get no columns" % node.name
+        )
+    if not use.cases:
+        raise DecodeError("union %s: 'tag' needs 'cases' saying which member each value selects" % node.name)
+    always = [m for m in node.members if m.name == path[0] or m.name in keep]
+
+    chosen = {}  # type: Dict[str, List[int]]
+    order = []  # type: List[str]
+    for key, member_name in use.cases.items():
+        member_name = str(member_name)
+        _check_member_names(node, [member_name], "cases")
+        if member_name == path[0]:
+            raise DecodeError(
+                "union %s: case %r selects %r, which is the identifier itself"
+                % (node.name, key, member_name)
+            )
+        if member_name in keep:
+            raise DecodeError(
+                "union %s: %r is under 'keep', so it is decoded whatever the identifier "
+                "says, and cannot also be a case" % (node.name, member_name)
+            )
+        value = _tag_value(registry, node, tag_type, key)
+        for other, values in chosen.items():
+            if value in values:
+                raise DecodeError(
+                    "union %s: identifier value %r selects both %s and %s"
+                    % (node.name, key, other, member_name)
+                )
+        if member_name not in chosen:
+            chosen[member_name] = []
+            order.append(member_name)
+        chosen[member_name].append(value)
+    by_name = dict((m.name, m) for m in node.members if m.name)
+    alternatives = [(by_name[name], chosen[name]) for name in order]
+    return _TagPlan(tag, tag_type, (identifier.offset, ident_size), always, alternatives)
+
+
+def _follow(registry: TypeRegistry, node: Any, member: Any, path: List[str]) -> Tuple[Any, str]:
+    """Walk a dotted tag path down through nested structs.
+
+    Returns the member at its end with an offset relative to the union, and
+    the name of the type it resolves to.
+    """
+    offset = member.offset
+    current = member
+    for depth, part in enumerate(path[1:], 1):
+        inner = registry.resolve(current.type)
+        if inner is None or inner.kind not in (KIND_STRUCT, KIND_UNION):
+            raise DecodeError(
+                "union %s: tag path %r cannot go into %s, which is not a struct"
+                % (node.name, ".".join(path), ".".join(path[:depth]))
+            )
+        found = [m for m in inner.members if m.name == part]
+        if not found:
+            raise DecodeError(
+                "union %s: %s has no member %r (in tag path %r); its members are %s"
+                % (node.name, inner.name, part, ".".join(path), ", ".join(_member_names(inner)))
+            )
+        current = found[0]
+        offset += current.offset
+    resolved = registry.resolve(current.type)
+    if resolved is None:
+        raise DecodeError(
+            "union %s: the type of tag %r is not in the type file" % (node.name, ".".join(path))
+        )
+    if resolved.kind not in (KIND_BASE, KIND_ENUM) or getattr(resolved, "encoding", None) == ENC_FLOAT:
+        raise DecodeError(
+            "union %s: tag %r is a %s, not an integer or enum"
+            % (node.name, ".".join(path), resolved.name)
+        )
+    bit_offset = current.bit_offset
+    if bit_offset is not None:
+        bit_offset = bit_offset + (offset - current.offset) * 8
+    tag = Member(
+        name=current.name,
+        offset=offset,
+        type=current.type,
+        bit_size=current.bit_size,
+        bit_offset=bit_offset,
+    )
+    return tag, resolved.name
+
+
+def _tag_value(registry: TypeRegistry, node: Any, tag_type: str, key: Any) -> int:
+    """A case key as the number the identifier will read as."""
+    if isinstance(key, bool):
+        raise DecodeError("union %s: case %r must be a number or enumerator name" % (node.name, key))
+    if isinstance(key, int):
+        return key
+    text = str(key).strip()
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+    enum = registry.resolve(tag_type)
+    if enum is not None and enum.kind == KIND_ENUM:
+        for value, name in enum.values.items():
+            if name == text:
+                return value
+        raise DecodeError(
+            "union %s: case %r is not a value of %s; its enumerators are %s"
+            % (node.name, key, enum.name, ", ".join(sorted(enum.values.values())))
+        )
+    raise DecodeError(
+        "union %s: case %r must be a number, since the identifier %s is not an enum"
+        % (node.name, key, tag_type)
+    )

@@ -72,6 +72,48 @@ struct UnionTlm_t
     uint32                    Tag;
 };
 
+/* A tagged union: the identifier says which of the other members the bytes
+ * hold, and every alternative begins with that same identifier. */
+enum ItemKind_t
+{
+    ITEM_NONE  = 0,
+    ITEM_TEMP  = 1,
+    ITEM_COUNT = 2
+};
+
+struct ItemHdr_t
+{
+    ItemKind_t Kind;
+    uint32     Seq;
+};
+
+struct TempItem_t
+{
+    ItemHdr_t Hdr;
+    float     Celsius;
+};
+
+struct CountItem_t
+{
+    ItemHdr_t Hdr;
+    uint32    Count;
+    uint8     Flags;
+};
+
+union Item_t
+{
+    ItemHdr_t   Hdr;
+    TempItem_t  Temp;
+    CountItem_t Count;
+    uint8       Bytes[16];
+};
+
+struct ItemTlm_t
+{
+    CFE_MSG_TelemetryHeader_t TelemetryHeader;
+    Item_t                    Items[2];
+};
+
 struct NoopCmd_t
 {
     CFE_MSG_CommandHeader_t CommandHeader;

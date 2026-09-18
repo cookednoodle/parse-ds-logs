@@ -22,9 +22,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from .decode import Decoder, DecodeError, Options, compile_struct
+from .decode import (
+    UNION_BYTES_DROP,
+    UNION_BYTES_KEEP,
+    Decoder,
+    DecodeError,
+    Options,
+    UnionUse,
+    check_union_use,
+    compile_struct,
+)
 from .dsfile import Geometry
 from .typemodel import KIND_STRUCT, KIND_UNION, TypeRegistry, close_names
+
+# Keys a mapping may carry beside its message IDs.
+_SETTINGS = ("header_types", "unions", "union_bytes")
 
 _SAFE_CHARS = "-_."
 
@@ -109,7 +121,16 @@ class MidEntry(object):
 class Mapping(object):
     """A mapping file that has been read and checked, but not compiled."""
 
-    __slots__ = ("path", "entries", "skipped", "skipped_apps", "generated", "header_types")
+    __slots__ = (
+        "path",
+        "entries",
+        "skipped",
+        "skipped_apps",
+        "generated",
+        "header_types",
+        "unions",
+        "union_bytes",
+    )
 
     def __init__(
         self,
@@ -119,11 +140,18 @@ class Mapping(object):
         skipped_apps: Optional[List[str]] = None,
         generated: bool = False,
         header_types: Optional[List[str]] = None,
+        unions: Optional[Dict[str, UnionUse]] = None,
+        union_bytes: Optional[str] = None,
     ) -> None:
         self.path = path
         self.entries = entries
         # Packet header types this project defines, declared in the file.
         self.header_types = header_types or []
+        # How particular unions are used, keyed by the name written in the file.
+        self.unions = unions or {}
+        # Whether byte array views of other unions get columns; None means
+        # the file did not say.
+        self.union_bytes = union_bytes
         # (name, why) for entries a generated map could not resolve.
         self.skipped = skipped or []
         # Directories the generating scanner did not look at.
@@ -182,11 +210,13 @@ def read_mapping(path: str) -> Mapping:
     if not isinstance(data, dict):
         raise DictionaryError("%s must hold a mapping with a 'mids' key" % path)
     declared = [str(name) for name in (data.get("header_types") or [])]
+    unions = _read_unions(data.get("unions"), path)
+    union_bytes = _read_union_bytes(data.get("union_bytes"), path)
     mids = data.get("mids", data)
-    if mids is data and declared:
+    if mids is data and any(key in data for key in _SETTINGS):
         # A file with no 'mids' key is all message IDs, so lift the
-        # declaration out before it is read as one.
-        mids = dict((k, v) for k, v in data.items() if k != "header_types")
+        # settings out before they are read as one.
+        mids = dict((k, v) for k, v in data.items() if k not in _SETTINGS)
     if not isinstance(mids, dict) or not mids:
         raise DictionaryError("%s has no message IDs under 'mids'" % path)
     if _looks_generated(data, mids):
@@ -203,12 +233,102 @@ def read_mapping(path: str) -> Mapping:
             skipped_apps=[str(app) for app in (data.get("skipped_apps") or [])],
             generated=True,
             header_types=declared,
+            unions=unions,
+            union_bytes=union_bytes,
         )
     return Mapping(
         path,
         [_read_entry(key, value) for key, value in mids.items()],
         header_types=declared,
+        unions=unions,
+        union_bytes=union_bytes,
     )
+
+
+def _read_union_bytes(value: Any, path: str) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text not in (UNION_BYTES_KEEP, UNION_BYTES_DROP):
+        raise DictionaryError(
+            "%s: 'union_bytes' must be %s or %s, not %r"
+            % (path, UNION_BYTES_KEEP, UNION_BYTES_DROP, value)
+        )
+    return text
+
+
+_UNION_KEYS = ("keep", "drop", "tag", "cases")
+
+
+def _read_unions(data: Any, path: str) -> Dict[str, UnionUse]:
+    """Read the 'unions' section: how each named union is used.
+
+    Only the shape is judged here.  Whether the members exist is checked
+    against the type file when the dictionary is loaded.
+    """
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise DictionaryError("%s: 'unions' must map union type names to how each is used" % path)
+    out = {}  # type: Dict[str, UnionUse]
+    for name, spec in data.items():
+        where = "%s: unions.%s" % (path, name)
+        if not isinstance(spec, dict):
+            raise DictionaryError(
+                "%s must be a mapping with 'keep', 'drop', or 'tag' and 'cases'" % where
+            )
+        unknown = [key for key in spec if key not in _UNION_KEYS]
+        if unknown:
+            raise DictionaryError(
+                "%s has unknown key(s) %s; it takes %s"
+                % (where, ", ".join(repr(k) for k in unknown), ", ".join(_UNION_KEYS))
+            )
+        keep = _name_list(spec.get("keep"), where, "keep")
+        drop = _name_list(spec.get("drop"), where, "drop")
+        tag = spec.get("tag")
+        cases = spec.get("cases")
+        if keep is not None and drop is not None:
+            raise DictionaryError("%s: give 'keep' or 'drop', not both" % where)
+        if tag is not None:
+            if not isinstance(tag, str) or not tag.strip():
+                raise DictionaryError("%s: 'tag' must name the member holding the identifier" % where)
+            if not isinstance(cases, dict) or not cases:
+                raise DictionaryError(
+                    "%s: 'tag' needs 'cases', mapping each identifier value to a member" % where
+                )
+            if drop is not None:
+                raise DictionaryError(
+                    "%s: 'drop' cannot go with 'tag'; members not named in 'cases' "
+                    "or 'keep' already get no columns" % where
+                )
+            for key, member in cases.items():
+                if not isinstance(member, str) or not member.strip():
+                    raise DictionaryError("%s: case %r must name a member" % (where, key))
+            out[str(name)] = UnionUse(
+                keep=keep,
+                tag=tag.strip(),
+                cases=dict((k, v.strip()) for k, v in cases.items()),
+            )
+            continue
+        if cases is not None:
+            raise DictionaryError("%s: 'cases' needs 'tag' to say which member is the identifier" % where)
+        if keep is None and drop is None:
+            raise DictionaryError("%s says nothing: give 'keep', 'drop', or 'tag' and 'cases'" % where)
+        out[str(name)] = UnionUse(keep=keep, drop=drop)
+    return out
+
+
+def _name_list(value: Any, where: str, key: str) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [part for part in value.split(",")]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise DictionaryError("%s: '%s' must be a member name or a list of them" % (where, key))
+    names = [v.strip() for v in value if v.strip()]
+    if not names:
+        raise DictionaryError("%s: '%s' names no member" % (where, key))
+    return names
 
 
 def _looks_generated(data: Dict[str, Any], mids: Dict[Any, Any]) -> bool:
@@ -364,13 +484,18 @@ class Dictionary(object):
         declared = set(options.header_types)
         declared.update(mapping.header_types)
         declared.update(registry.header_types)
+        changes = {}  # type: Dict[str, Any]
         if declared != set(options.header_types):
-            options = Options(
-                char_arrays=options.char_arrays,
-                enum_values=options.enum_values,
-                max_depth=options.max_depth,
-                header_types=declared,
-            )
+            changes["header_types"] = declared
+        if mapping.union_bytes == UNION_BYTES_DROP and options.union_bytes != UNION_BYTES_DROP:
+            changes["union_bytes"] = UNION_BYTES_DROP
+        unions = _resolve_unions(mapping, index, registry, warn)
+        if unions:
+            merged = dict(options.unions)
+            merged.update(unions)
+            changes["unions"] = merged
+        if changes:
+            options = options.replace(**changes)
         # Structs the type file says this build does not have.  Their message
         # IDs are passed over rather than failing the run.
         left_out = frozenset(registry.unresolved)
@@ -411,6 +536,37 @@ class Dictionary(object):
                 "with '--mids %s', or check the type file matches this build." % (path, path)
             )
         return dictionary
+
+
+def _resolve_unions(
+    mapping: Mapping, index: "_NameIndex", registry: TypeRegistry, warn: Any
+) -> Dict[str, UnionUse]:
+    """Tie each 'unions' entry to the union in the type file it describes.
+
+    A name that is not in the file is passed over with a warning rather than
+    an error, for the same reason a struct can be: the mapping may describe
+    more of the code base than this build holds.  An entry that is there but
+    wrong, naming a member the union lacks, is an error.
+    """
+    out = {}  # type: Dict[str, UnionUse]
+    for name, use in mapping.unions.items():
+        try:
+            key = index.resolve(name)
+        except UnknownStructError as exc:
+            warn("unions: %s, so that entry is ignored" % exc)
+            continue
+        node = registry.resolve(key)
+        if node is None or node.kind != KIND_UNION:
+            raise DictionaryError(
+                "%s: unions.%s: %s is a %s, not a union"
+                % (mapping.path, name, key, node.kind if node is not None else "typedef")
+            )
+        try:
+            check_union_use(registry, node, use)
+        except DecodeError as exc:
+            raise DictionaryError("%s: unions.%s: %s" % (mapping.path, name, exc))
+        out[node.name] = use
+    return out
 
 
 def _read_entry(key: Any, value: Any) -> MidEntry:
