@@ -105,8 +105,14 @@ def cmd_extract(args: argparse.Namespace) -> int:
             % (len(wanted), args.mids)
         )
         print("  structs from the mapping:")
+        apps = mapping.struct_apps()
         for name in wanted:
-            print("    %-34s %s" % (name, names.describe(name)))
+            owners = apps.get(name)
+            print(
+                "    %-34s %s%s"
+                % (name, names.describe(name), ("  [%s]" % ", ".join(owners)) if owners else "")
+            )
+        _report_mapping_gaps(mapping)
     if registry.geometry:
         print("  header sizes:")
         for name in sorted(registry.geometry):
@@ -127,6 +133,22 @@ def cmd_extract(args: argparse.Namespace) -> int:
         for name in sorted(registry.types):
             print("    %s" % name)
     return 0
+
+
+def _report_mapping_gaps(mapping: Any) -> None:
+    """Say what a generated map could not resolve, so it can be chased down."""
+    if mapping.skipped:
+        print(
+            "  %d entr(y/ies) in %s could not be used:"
+            % (len(mapping.skipped), mapping.path)
+        )
+        for name, reason in mapping.skipped:
+            print("    %-34s %s" % (name, reason))
+    if mapping.skipped_apps:
+        print(
+            "  the map records %d app(s) its scanner did not read: %s"
+            % (len(mapping.skipped_apps), ", ".join(mapping.skipped_apps))
+        )
 
 
 # -- info ----------------------------------------------------------------

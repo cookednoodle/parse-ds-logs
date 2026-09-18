@@ -48,8 +48,9 @@ mid-recording.
 
 ## 3. Write the message ID mapping
 
-Message IDs are preprocessor macros, and macros leave no trace in debug info, so this one
-file is written by hand:
+Message IDs are preprocessor macros, and macros leave no trace in debug info, so this one file
+does not come from the build. Write it by hand, or hand over what a script of yours already
+produces (see below). By hand it looks like this:
 
 ```yaml
 mids:
@@ -90,6 +91,49 @@ typedef struct {
 Mapping a struct that has no cFS message header of its own, a bare payload type, also works:
 the tool notices and decodes it starting after the packet header. See **Limitations** for two
 ways of embedding a header that are not recognized.
+
+### If a script already finds your message IDs
+
+If you generate a message ID map by scanning your flight software, pass that file to `--mids`
+directly. It is recognized by its contents, so there is nothing to convert and nothing to keep
+in step with your build. The shape it expects is the one a scanner naturally produces: an object
+under `mids` keyed by message ID value, with `skipped_apps` alongside it.
+
+```json
+{
+  "mids": {
+    "2192": {
+      "name": "CTRL_APP_HK_TLM_MID", "value": 2192, "type": "telem",
+      "struct": "CtrlApp::HkTlm_t",
+      "usages": [{"app": "ctrl_app", "direction": "outgoing", "pipe": null, "fcode": null}]
+    },
+    "6274": {
+      "name": "CTRL_APP_CMD_MID", "value": 6274, "type": "command",
+      "fcodes": {
+        "null": {"name": null, "value": null, "struct": "CtrlApp::NoopCmd_t", "usages": []},
+        "1": {"name": "CTRL_APP_SET_MODE_CC", "value": 1,
+              "struct": "CtrlApp::SetModeCmd_t", "usages": []}
+      }
+    }
+  },
+  "skipped_apps": ["legacy_app"]
+}
+```
+
+What it makes of that:
+
+- A command's structs come from `fcodes`. The `"null"` key, meaning a usage that named no
+  function code, becomes the struct used for any function code without one of its own. A
+  function code's resolved `value` is preferred over its key.
+- CSV files are named from each entry's `name`, so you get `CTRL_APP_HK_TLM_MID.csv`.
+- An entry whose message ID or struct the scanner could not work out, including a struct left as
+  `"UNKNOWN"`, is set aside rather than failing the run. A scan of a whole code base is expected
+  to come back with loose ends. `extract --mids` lists every one with the reason, and `decode`
+  warns that some were skipped.
+- `usages` says which app sends each message, so the extract summary names it next to the
+  struct. Senders are preferred over receivers, since the struct recorded is the sender's.
+- `skipped_apps` is reported too, which answers the question of why a message ID you expected is
+  not in the map.
 
 ## 4. Extract the type definitions
 

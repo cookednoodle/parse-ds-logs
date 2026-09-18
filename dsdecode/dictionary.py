@@ -1,9 +1,16 @@
 """Tie message IDs to the structs that decode them.
 
-The mapping comes from a small YAML or JSON file the user writes, because a
-message ID is a preprocessor macro and macros leave no trace in debug info.
-Each entry names one message ID and the struct its packets carry; commands may
-choose a struct by function code.
+The mapping comes from a YAML or JSON file, because a message ID is a
+preprocessor macro and macros leave no trace in debug info.  Two shapes are
+read, told apart by their contents:
+
+* the short one written by hand, where each entry names one message ID and the
+  struct its packets carry, and a command may choose a struct by function code;
+* the output of a scanner over the flight software, keyed by message ID value,
+  carrying the struct under ``fcodes`` for commands and recording which apps
+  send and receive each message.  Entries it could not resolve are skipped and
+  reported rather than failing the run, since a scan of a whole code base is
+  expected to come back with loose ends.
 """
 
 from __future__ import annotations
@@ -20,6 +27,9 @@ from .dsfile import Geometry
 from .typemodel import KIND_STRUCT, KIND_UNION, TypeRegistry, close_names
 
 _SAFE_CHARS = "-_."
+
+# What a generated map writes where it could not work out a struct.
+UNRESOLVED_STRUCT = "UNKNOWN"
 
 
 class DictionaryError(Exception):
@@ -62,7 +72,16 @@ class MidEntry(object):
     types have been read.
     """
 
-    __slots__ = ("name", "value", "default_struct", "by_fcn", "decoders", "file_name")
+    __slots__ = (
+        "name",
+        "value",
+        "default_struct",
+        "by_fcn",
+        "decoders",
+        "file_name",
+        "apps",
+        "publishers",
+    )
 
     def __init__(self, name: str, value: int) -> None:
         self.name = name
@@ -71,6 +90,9 @@ class MidEntry(object):
         self.by_fcn = {}  # type: Dict[int, str]
         self.decoders = {}  # type: Dict[Optional[int], Decoder]
         self.file_name = safe_name(name)
+        # Filled from a generated map, which knows where a message comes from.
+        self.apps = []  # type: List[str]
+        self.publishers = []  # type: List[str]
 
     def decoder_for(self, fcn_code: Optional[int]) -> Optional[Decoder]:
         if fcn_code is not None and fcn_code in self.decoders:
@@ -87,11 +109,43 @@ class MidEntry(object):
 class Mapping(object):
     """A mapping file that has been read and checked, but not compiled."""
 
-    __slots__ = ("path", "entries")
+    __slots__ = ("path", "entries", "skipped", "skipped_apps", "generated")
 
-    def __init__(self, path: str, entries: List[MidEntry]) -> None:
+    def __init__(
+        self,
+        path: str,
+        entries: List[MidEntry],
+        skipped: Optional[List[Tuple[str, str]]] = None,
+        skipped_apps: Optional[List[str]] = None,
+        generated: bool = False,
+    ) -> None:
         self.path = path
         self.entries = entries
+        # (name, why) for entries a generated map could not resolve.
+        self.skipped = skipped or []
+        # Directories the generating scanner did not look at.
+        self.skipped_apps = skipped_apps or []
+        self.generated = generated
+
+    def struct_apps(self) -> Dict[str, List[str]]:
+        """Which apps each struct belongs to, for the extract summary.
+
+        Senders are preferred over receivers, because the app that publishes a
+        message is the one whose view of the struct was recorded.
+        """
+        out = {}  # type: Dict[str, List[str]]
+        for entry in self.entries:
+            apps = entry.publishers or entry.apps
+            if not apps:
+                continue
+            for struct in [entry.default_struct] + list(entry.by_fcn.values()):
+                if not struct:
+                    continue
+                known = out.setdefault(struct, [])
+                for app in apps:
+                    if app not in known:
+                        known.append(app)
+        return out
 
     def struct_names(self) -> List[str]:
         """Every struct the mapping names, in file order, without repeats."""
@@ -127,7 +181,129 @@ def read_mapping(path: str) -> Mapping:
     mids = data.get("mids", data)
     if not isinstance(mids, dict) or not mids:
         raise DictionaryError("%s has no message IDs under 'mids'" % path)
+    if _looks_generated(data, mids):
+        entries, skipped = _read_generated(mids)
+        if not entries:
+            raise DictionaryError(
+                "%s has no message ID that could be used: %s"
+                % (path, "; ".join("%s (%s)" % pair for pair in skipped[:5]))
+            )
+        return Mapping(
+            path,
+            entries,
+            skipped=skipped,
+            skipped_apps=[str(app) for app in (data.get("skipped_apps") or [])],
+            generated=True,
+        )
     return Mapping(path, [_read_entry(key, value) for key, value in mids.items()])
+
+
+def _looks_generated(data: Dict[str, Any], mids: Dict[Any, Any]) -> bool:
+    """Tell a generated map from one written by hand.
+
+    Only a generated map records the apps a message is used by, the function
+    codes under their own key, or the directories its scanner skipped.
+    """
+    if "skipped_apps" in data:
+        return True
+    for value in mids.values():
+        if isinstance(value, dict) and ("fcodes" in value or "usages" in value):
+            return True
+    return False
+
+
+def _usable_struct(struct: Any) -> bool:
+    """False for a struct a scanner could not work out."""
+    return (
+        isinstance(struct, str)
+        and bool(struct.strip())
+        and struct.strip() != UNRESOLVED_STRUCT
+    )
+
+
+def _read_generated(mids: Dict[Any, Any]) -> Tuple[List[MidEntry], List[Tuple[str, str]]]:
+    """Turn a generated map into entries, setting aside what cannot be used.
+
+    A scan of a whole code base comes back with message IDs whose value or
+    struct it could not resolve.  Those are no use for decoding, but they are
+    not a reason to refuse the file, so they are collected and reported.
+    """
+    entries = []  # type: List[MidEntry]
+    skipped = []  # type: List[Tuple[str, str]]
+    for key, value in mids.items():
+        if not isinstance(value, dict):
+            skipped.append((str(key), "the entry is not an object"))
+            continue
+        name = str(value.get("name") or key)
+        if value.get("value") is None:
+            skipped.append((name, "its message ID was never resolved"))
+            continue
+        try:
+            mid_value = parse_int(value.get("value"), "value of %s" % name)
+        except DictionaryError as exc:
+            skipped.append((name, str(exc)))
+            continue
+        entry = MidEntry(name=name, value=mid_value)
+        if value.get("type") == "command":
+            _read_generated_command(entry, value, skipped)
+        else:
+            struct = value.get("struct")
+            if _usable_struct(struct):
+                entry.default_struct = str(struct).strip()
+            _record_usages(entry, value.get("usages"))
+        if entry.default_struct is None and not entry.by_fcn:
+            skipped.append((name, "no struct was resolved for it"))
+            continue
+        entries.append(entry)
+    return entries, skipped
+
+
+def _read_generated_command(
+    entry: MidEntry, value: Dict[str, Any], skipped: List[Tuple[str, str]]
+) -> None:
+    """Read a command's structs, which sit under one key per function code."""
+    fcodes = value.get("fcodes")
+    if not isinstance(fcodes, dict):
+        skipped.append((entry.name, "it is a command with no function codes"))
+        return
+    for key, fcode in fcodes.items():
+        if not isinstance(fcode, dict):
+            continue
+        label = str(fcode.get("name") or key)
+        where = "%s function code %s" % (entry.name, label)
+        struct = fcode.get("struct")
+        if not _usable_struct(struct):
+            skipped.append((where, "no struct was resolved for it"))
+            continue
+        _record_usages(entry, fcode.get("usages"))
+        # A usage that named no function code stands for every other one.
+        if key is None or str(key).strip().lower() == "null":
+            entry.default_struct = str(struct).strip()
+            continue
+        code = fcode.get("value")
+        if code is None:
+            code = key
+        try:
+            entry.by_fcn[parse_int(code, where)] = str(struct).strip()
+        except DictionaryError:
+            skipped.append((where, "its function code was never resolved"))
+
+
+def _record_usages(entry: MidEntry, usages: Any) -> None:
+    """Note which apps a message passes through, sender first."""
+    if not isinstance(usages, list):
+        return
+    for usage in usages:
+        if not isinstance(usage, dict):
+            continue
+        app = usage.get("app")
+        if not app:
+            continue
+        app = str(app)
+        if app not in entry.apps:
+            entry.apps.append(app)
+        if usage.get("direction") == "outgoing" and app not in entry.publishers:
+            entry.publishers.append(app)
 
 
 class Dictionary(object):
@@ -157,6 +333,15 @@ class Dictionary(object):
     ) -> "Dictionary":
         warn = warn or (lambda msg: print("warning: %s" % msg, file=sys.stderr))
         mapping = read_mapping(path)
+        if mapping.skipped:
+            shown = ", ".join(name for name, _ in mapping.skipped[:3])
+            if len(mapping.skipped) > 3:
+                shown += ", and %d more" % (len(mapping.skipped) - 3)
+            warn(
+                "%d entr(y/ies) in %s have no message ID or no struct and were "
+                "skipped: %s. Run 'dsdecode extract --mids %s' to see them all."
+                % (len(mapping.skipped), path, shown, path)
+            )
 
         dictionary = cls(registry, geometry)
         index = _NameIndex(registry)
