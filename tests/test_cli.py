@@ -462,30 +462,77 @@ def test_an_unqualified_name_is_reported_with_what_it_matched(workspace, tmp_pat
     assert "sample::HkTlm_t" in capsys.readouterr().out
 
 
-def test_a_struct_missing_from_the_build_fails_the_extract(workspace, tmp_path, capsys):
-    mids = str(tmp_path / "typo.yaml")
-    with io.open(mids, "w", encoding="utf-8") as handle:
-        handle.write("mids:\n  HK: {value: 0x0890, struct: sample::HkTlmX_t}\n")
-    out = str(tmp_path / "types-typo.json")
-    assert main(["extract", "--mids", mids, "-o", out, workspace["so"]]) == 1
-    assert "sample::HkTlmX_t" in capsys.readouterr().err
-    assert not os.path.exists(out)
-
-
-def test_allow_missing_writes_the_file_anyway(workspace, tmp_path, capsys):
-    mids = str(tmp_path / "partial.yaml")
-    with io.open(mids, "w", encoding="utf-8") as handle:
+def partial_mapping(tmp_path, name="partial.yaml"):
+    """A mapping naming one struct this build has and one it does not."""
+    path = str(tmp_path / name)
+    with io.open(path, "w", encoding="utf-8") as handle:
         handle.write(
             "mids:\n"
             "  HK: {value: 0x0890, struct: sample::HkTlm_t}\n"
             "  GONE: {value: 0x0899, struct: NotBuiltYet_t}\n"
         )
+    return path
+
+
+def test_a_struct_missing_from_the_build_is_left_out_not_fatal(workspace, tmp_path, capsys):
+    mids = partial_mapping(tmp_path)
     out = str(tmp_path / "types-partial.json")
-    assert (
-        main(["extract", "--mids", mids, "--allow-missing", "-o", out, workspace["so"]]) == 0
-    )
-    assert read_types(out)["roots"] == {"sample::HkTlm_t": ["sample::HkTlm_t"]}
+    assert main(["extract", "--mids", mids, "-o", out, workspace["so"]]) == 0
+    written = read_types(out)
+    assert written["roots"] == {"sample::HkTlm_t": ["sample::HkTlm_t"]}
+    assert written["unresolved"] == ["NotBuiltYet_t"]
     assert "NotBuiltYet_t" in capsys.readouterr().err
+
+
+def test_the_summary_counts_absent_structs_without_listing_them(workspace, tmp_path, capsys):
+    mids = partial_mapping(tmp_path)
+    main(["extract", "--mids", mids, "-o", str(tmp_path / "t.json"), workspace["so"]])
+    printed = capsys.readouterr().out
+    assert "1 struct(s) named in the mapping are not in this build" in printed
+    assert "run with -v to list them" in printed
+    assert "NotBuiltYet_t" not in printed, "the audit list should not be buried"
+
+
+def test_verbose_lists_the_absent_structs(workspace, tmp_path, capsys):
+    mids = partial_mapping(tmp_path)
+    main(["extract", "--mids", mids, "-v", "-o", str(tmp_path / "t.json"), workspace["so"]])
+    assert "NotBuiltYet_t" in capsys.readouterr().out
+
+
+def test_strict_makes_a_missing_struct_fatal_again(workspace, tmp_path, capsys):
+    mids = partial_mapping(tmp_path)
+    out = str(tmp_path / "types-strict.json")
+    assert main(["extract", "--mids", mids, "--strict", "-o", out, workspace["so"]]) == 1
+    assert "NotBuiltYet_t" in capsys.readouterr().err
+    assert not os.path.exists(out)
+
+
+def test_a_mapping_matching_nothing_in_the_build_still_fails(workspace, tmp_path, capsys):
+    mids = str(tmp_path / "all-absent.yaml")
+    with io.open(mids, "w", encoding="utf-8") as handle:
+        handle.write("mids:\n  A: {value: 0x0890, struct: NotHere_t}\n")
+    out = str(tmp_path / "types-none.json")
+    assert main(["extract", "--mids", mids, "-o", out, workspace["so"]]) == 1
+    assert "none of the" in capsys.readouterr().err
+    assert not os.path.exists(out)
+
+
+def test_decode_skips_message_ids_whose_struct_is_absent(workspace, tmp_path, capsys):
+    """The other half: a type file with holes still decodes what it can."""
+    mids = partial_mapping(tmp_path)
+    types = str(tmp_path / "types-partial.json")
+    assert main(["extract", "--mids", mids, "-o", types, workspace["so"]]) == 0
+    capsys.readouterr()
+    out_dir = str(tmp_path / "out-partial")
+    assert (
+        main(["decode", "--types", types, "--mids", mids, "--out", out_dir, workspace["ds"]])
+        == 0
+    )
+    assert os.listdir(out_dir) == ["HK.csv"]
+    assert len(read_csv(os.path.join(out_dir, "HK.csv"))) == 2
+    err = capsys.readouterr().err
+    assert "1 message ID(s) name a struct this build does not have" in err
+    assert "GONE" in err
 
 
 def test_a_mapping_that_grew_says_to_extract_again(workspace, tmp_path, capsys):

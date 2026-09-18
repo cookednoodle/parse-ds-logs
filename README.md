@@ -170,9 +170,16 @@ build uses CCSDS version 1 or 2 message IDs, and how long the DS header is. They
 whether or not a message struct refers to them. If one is missing, its default is used and the
 command says so.
 
-A struct the mapping names that is not in any of the binaries stops the run, with close names
-suggested, so a typo surfaces here rather than at decode time. Use `--allow-missing` to carry on
-without it, and `-v` to list every type kept.
+A mapping usually covers a whole code base while the binaries you pass are part of one, so
+structs it names that are not in this build are expected rather than a problem. They are counted,
+recorded in the type file, and left out; `-v` lists them, with close names suggested while the
+list is short enough for that to mean anything. `decode` then skips those message IDs and says
+how many, so a mapping full of other apps costs you nothing. Pass `--strict` if you would rather
+the run stopped.
+
+Two things are still errors, because both mean the type file would be useless: `--strict` with
+anything missing, and a mapping where nothing at all was found, which usually means the wrong
+binaries or a build without `-g`.
 
 **Re-run this after adding a message ID to the mapping.** The type file records that it was
 filtered, so if you forget, decode says so and tells you to extract again.

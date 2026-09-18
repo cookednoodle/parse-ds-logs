@@ -346,8 +346,15 @@ class Dictionary(object):
         dictionary = cls(registry, geometry)
         index = _NameIndex(registry)
         options = options or Options()
+        # Structs the type file says this build does not have.  Their message
+        # IDs are passed over rather than failing the run.
+        left_out = frozenset(registry.unresolved)
+        dropped = []  # type: List[str]
         for entry in mapping.entries:
-            _compile_entry(entry, index, options, registry, warn)
+            _compile_entry(entry, index, options, registry, warn, left_out)
+            if not entry.decoders:
+                dropped.append(entry.name)
+                continue
             existing = dictionary.entries.get(entry.value)
             if existing is not None:
                 warn(
@@ -362,6 +369,20 @@ class Dictionary(object):
                         "%s has no cFS message header, so it is decoded as a bare "
                         "payload starting after the packet header" % decoder.type_name
                     )
+        if dropped:
+            shown = ", ".join(dropped[:3])
+            if len(dropped) > 3:
+                shown += ", and %d more" % (len(dropped) - 3)
+            warn(
+                "%d message ID(s) name a struct this build does not have, so their "
+                "packets are left undecoded and counted as unmapped: %s"
+                % (len(dropped), shown)
+            )
+        if not dictionary.entries:
+            raise DictionaryError(
+                "no message ID in %s has a struct in the type file. Extract again "
+                "with '--mids %s', or check the type file matches this build." % (path, path)
+            )
         return dictionary
 
 
@@ -423,13 +444,22 @@ def _compile_entry(
     options: Options,
     registry: TypeRegistry,
     warn: Optional[Any] = None,
+    left_out: Optional[Any] = None,
 ) -> None:
-    """Attach a decoder to an entry for each struct it names."""
-    if entry.default_struct is not None:
+    """Attach a decoder to an entry for each struct it names.
+
+    A struct the type file records as absent from the build is passed over, not
+    compiled: a mapping usually covers more apps than any one set of binaries
+    holds.  A command keeps the function codes whose structs are present.
+    """
+    absent = left_out or frozenset()
+    if entry.default_struct is not None and entry.default_struct not in absent:
         entry.decoders[None] = _compile(
             entry.default_struct, index, options, registry, entry.name, warn
         )
     for code, struct_name in entry.by_fcn.items():
+        if struct_name in absent:
+            continue
         entry.decoders[code] = _compile(
             struct_name, index, options, registry, entry.name, warn
         )

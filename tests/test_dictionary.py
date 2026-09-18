@@ -476,3 +476,89 @@ def test_a_dropped_column_is_warned_about_when_the_mapping_loads(tmp_path, regis
     )
     assert mids.lookup(0x0890).decoder_for(None).columns == ["Good"]
     assert any("Lost" in w and "NotInTheFile_t" in w for w in warnings)
+
+
+# -- structs this build does not have --------------------------------------
+
+
+def registry_missing(registry, absent):
+    """A copy of the build that records some mapping names as not present."""
+    from dsdecode.typemodel import TypeRegistry
+
+    return TypeRegistry(
+        types=dict(registry.types),
+        endian=registry.endian,
+        pointer_size=registry.pointer_size,
+        geometry=dict(registry.geometry),
+        filtered=True,
+        unresolved=list(absent),
+    )
+
+
+def test_a_message_id_whose_struct_is_absent_is_skipped(tmp_path, registry):
+    broken = registry_missing(registry, ["NotBuiltYet_t"])
+    warnings = []
+    mids = Dictionary.load(
+        write_mids(
+            tmp_path,
+            "mids:\n"
+            "  HK: {value: 0x0890, struct: sample::HkTlm_t}\n"
+            "  GONE: {value: 0x0899, struct: NotBuiltYet_t}\n",
+        ),
+        broken,
+        Geometry.from_registry(broken),
+        warn=warnings.append,
+    )
+    assert mids.lookup(0x0890) is not None
+    assert mids.lookup(0x0899) is None
+    assert any("GONE" in w and "does not have" in w for w in warnings)
+
+
+def test_a_command_keeps_the_function_codes_it_can_decode(tmp_path, registry):
+    broken = registry_missing(registry, ["NotBuiltYet_t"])
+    mids = Dictionary.load(
+        write_mids(
+            tmp_path,
+            "mids:\n"
+            "  CMD: \n"
+            "    value: 0x1882\n"
+            "    struct:\n"
+            "      default: sample::NoopCmd_t\n"
+            "      fcn: {1: NotBuiltYet_t, 2: sample::SetModeCmd_t}\n",
+        ),
+        broken,
+        Geometry.from_registry(broken),
+        warn=lambda message: None,
+    )
+    entry = mids.lookup(0x1882)
+    assert entry is not None
+    assert entry.decoder_for(None).type_name == "sample::NoopCmd_t"
+    assert entry.decoder_for(2).type_name == "sample::SetModeCmd_t"
+    # Function code 1 falls back to the default rather than vanishing.
+    assert entry.decoder_for(1).type_name == "sample::NoopCmd_t"
+
+
+def test_a_mapping_with_nothing_left_to_decode_is_an_error(tmp_path, registry):
+    broken = registry_missing(registry, ["NotBuiltYet_t"])
+    with pytest.raises(DictionaryError) as caught:
+        Dictionary.load(
+            write_mids(tmp_path, "mids:\n  GONE: {value: 0x0899, struct: NotBuiltYet_t}\n"),
+            broken,
+            Geometry.from_registry(broken),
+            warn=lambda message: None,
+        )
+    assert "no message ID" in str(caught.value)
+
+
+def test_a_struct_not_recorded_as_absent_still_says_to_re_extract(tmp_path, registry):
+    """The stale type file case keeps its own, different, error."""
+    from dsdecode.dictionary import UnknownStructError
+
+    broken = registry_missing(registry, ["SomethingElse_t"])
+    with pytest.raises(UnknownStructError):
+        Dictionary.load(
+            write_mids(tmp_path, "mids:\n  NEW: {value: 0x0899, struct: NeverMentioned_t}\n"),
+            broken,
+            Geometry.from_registry(broken),
+            warn=lambda message: None,
+        )

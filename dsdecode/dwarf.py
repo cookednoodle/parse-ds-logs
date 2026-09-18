@@ -771,13 +771,18 @@ def extract(
     verbose: bool = False,
     warn: Optional[Any] = None,
     names: Optional[NameFilter] = None,
-    allow_missing: bool = False,
+    strict: bool = False,
 ) -> TypeRegistry:
     """Read types from ``paths`` into one registry.
 
     With no ``names`` filter this reads every type in the given files.  With
     one, it keeps the types that filter matches and, through the recursion in
     ``_key_for_die``, everything those types are built from.
+
+    A mapping that names structs this build does not have is normal, since a
+    mapping usually covers a whole code base while these binaries are a part of
+    it.  Those names are reported and recorded, not treated as a failure,
+    unless ``strict`` says otherwise.
     """
     extractor = Extractor(verbose=verbose, warn=warn, names=names)
     errors = []  # type: List[str]
@@ -795,12 +800,27 @@ def extract(
     for message in errors:
         extractor.warn(message)
     if names is not None:
-        _finish_filtered(registry, names, extractor, allow_missing)
+        _finish_filtered(registry, names, extractor, strict)
     return registry
 
 
+# Beyond a handful of absent names, a guess at what each one should have been
+# is noise rather than help.
+_MAX_SUGGESTED = 3
+
+
+def describe_missing(names: NameFilter, wanted: Sequence[str]) -> List[str]:
+    """Name each struct that was not found, suggesting a fix while that helps."""
+    out = []  # type: List[str]
+    with_hints = len(wanted) <= _MAX_SUGGESTED
+    for name in wanted:
+        hint = close_names(name, names.seen_names) if with_hints else []
+        out.append("%s%s" % (name, (" (did you mean %s?)" % ", ".join(hint)) if hint else ""))
+    return out
+
+
 def _finish_filtered(
-    registry: TypeRegistry, names: NameFilter, extractor: Extractor, allow_missing: bool
+    registry: TypeRegistry, names: NameFilter, extractor: Extractor, strict: bool
 ) -> None:
     """Record what each mapping name resolved to, and report what did not."""
     registry.filtered = True
@@ -815,18 +835,22 @@ def _finish_filtered(
             "so write the one you mean in the mapping" % (wanted, ", ".join(keys))
         )
     missing = names.missing()
+    registry.unresolved = list(missing)
     if not missing:
         return
-    details = []  # type: List[str]
-    for wanted in missing:
-        hint = close_names(wanted, names.seen_names)
-        details.append("%s%s" % (wanted, (" (did you mean %s?)" % ", ".join(hint)) if hint else ""))
-    message = "%d struct(s) named in the mapping are not in %s: %s" % (
+    if not registry.roots:
+        raise DwarfError(
+            "none of the %d struct(s) named in the mapping are in %s. Check that these "
+            "are the right binaries and that they were built with -g."
+            % (len(missing), ", ".join(registry.sources))
+        )
+    listed = describe_missing(names, missing[:_MAX_SUGGESTED])
+    message = "%d struct(s) named in the mapping are not in this build and were left out: %s" % (
         len(missing),
-        ", ".join(registry.sources),
-        "; ".join(details),
+        ", ".join(listed),
     )
-    if allow_missing:
-        extractor.warn(message)
-    else:
+    if len(missing) > _MAX_SUGGESTED:
+        message += ", and %d more" % (len(missing) - _MAX_SUGGESTED)
+    if strict:
         raise DwarfError(message)
+    extractor.warn(message)

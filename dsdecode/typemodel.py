@@ -193,6 +193,13 @@ GEOMETRY_DEFAULTS = {
 }
 
 
+# Measured against this project's own names: a genuine typo scores 0.86 and
+# up against what it should have been, while a name that simply is not in the
+# build tops out around 0.63.  Guessing across that gap misleads more than it
+# helps, so the threshold sits inside it.
+_LOOKS_LIKE_A_TYPO = 0.75
+
+
 def close_names(wanted: str, pool: Any, limit: int = 5) -> List[str]:
     """Names from ``pool`` that look like ``wanted``, for an error message.
 
@@ -200,7 +207,7 @@ def close_names(wanted: str, pool: Any, limit: int = 5) -> List[str]:
     the same kind of hint wherever it is caught.
     """
     tail = wanted.rsplit("::", 1)[-1]
-    return difflib.get_close_matches(tail, sorted(pool), n=limit, cutoff=0.6)
+    return difflib.get_close_matches(tail, sorted(pool), n=limit, cutoff=_LOOKS_LIKE_A_TYPO)
 
 
 def array_key(elem: str, dims: List[int]) -> str:
@@ -228,6 +235,10 @@ class TypeRegistry:
     # Set when extraction was filtered to a mapping: which registry type each
     # name in that mapping matched, so a filtered file can be audited.
     roots: Dict[str, List[str]] = field(default_factory=dict)
+    # Names the mapping asked for that this build does not have.  Kept so a
+    # later decode can tell a struct that was never here from one added to the
+    # mapping after this file was written.
+    unresolved: List[str] = field(default_factory=list)
     filtered: bool = False
 
     def __post_init__(self) -> None:
@@ -288,6 +299,7 @@ class TypeRegistry:
             "conflicts": list(self.conflicts),
             "filtered": self.filtered,
             "roots": dict((k, list(v)) for k, v in sorted(self.roots.items())),
+            "unresolved": sorted(self.unresolved),
             "types": dict((k, v.to_json()) for k, v in sorted(self.types.items())),
         }
 
@@ -310,6 +322,7 @@ class TypeRegistry:
             sources=list(data.get("sources") or []),
             conflicts=list(data.get("conflicts") or []),
             roots=dict((k, list(v)) for k, v in (data.get("roots") or {}).items()),
+            unresolved=[str(name) for name in (data.get("unresolved") or [])],
             filtered=bool(data.get("filtered")),
         )
         for name, node in (data.get("types") or {}).items():

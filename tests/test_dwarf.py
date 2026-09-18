@@ -210,25 +210,62 @@ def test_filtering_resolves_a_name_ignoring_case(fixture_so):
     assert reg.roots == {"hktlm_t": ["sample::HkTlm_t"]}
 
 
-def test_a_struct_that_is_not_in_the_build_stops_extraction(fixture_so):
+def test_a_struct_that_is_not_in_the_build_is_left_out_with_a_warning(fixture_so):
+    # A mapping covers a whole code base; these binaries are part of one.
+    warnings = []
+    reg = filtered(
+        fixture_so, ["sample::HkTlm_t", "sample::HkTlmX_t"], warn=warnings.append
+    )
+    assert reg.roots == {"sample::HkTlm_t": ["sample::HkTlm_t"]}
+    assert reg.unresolved == ["sample::HkTlmX_t"]
+    assert len(warnings) == 1
+    assert "sample::HkTlmX_t" in warnings[0]
+    assert "HkTlm_t" in warnings[0], "a short list should still suggest a close name"
+
+
+def test_strict_turns_a_missing_struct_back_into_an_error(fixture_so):
     from dsdecode.dwarf import DwarfError
 
     with pytest.raises(DwarfError) as caught:
-        filtered(fixture_so, ["sample::HkTlm_t", "sample::HkTlmX_t"])
-    message = str(caught.value)
-    assert "sample::HkTlmX_t" in message
-    assert "HkTlm_t" in message, "the error should suggest a close name"
+        filtered(fixture_so, ["sample::HkTlm_t", "sample::HkTlmX_t"], strict=True)
+    assert "sample::HkTlmX_t" in str(caught.value)
 
 
-def test_allow_missing_warns_and_carries_on(fixture_so):
+def test_a_long_list_of_missing_structs_drops_the_guesswork(fixture_so):
+    # Suggestions help for a typo.  For fifty absent apps they are noise.
     warnings = []
-    reg = filtered(
-        fixture_so, ["sample::HkTlm_t", "Nope_t"], allow_missing=True, warn=warnings.append
-    )
-    assert any("Nope_t" in w for w in warnings)
-    assert reg.roots == {"sample::HkTlm_t": ["sample::HkTlm_t"]}
+    absent = ["Absent%02d_t" % n for n in range(20)]
+    reg = filtered(fixture_so, ["sample::HkTlm_t"] + absent, warn=warnings.append)
+    assert len(reg.unresolved) == 20
+    assert len(warnings) == 1
+    assert "did you mean" not in warnings[0]
+    assert "and 17 more" in warnings[0]
+
+
+def test_a_mapping_that_matches_nothing_is_still_an_error(fixture_so):
+    from dsdecode.dwarf import DwarfError
+
+    with pytest.raises(DwarfError) as caught:
+        filtered(fixture_so, ["Nope_t", "AlsoNope_t"])
+    message = str(caught.value)
+    assert "none of the" in message
+    assert "-g" in message, "the likely cause is worth naming"
 
 
 def test_unfiltered_extraction_is_unchanged(registry):
     assert not registry.filtered
     assert registry.roots == {}
+
+
+def test_a_short_list_of_genuinely_absent_names_is_not_guessed_at(fixture_so):
+    # These are short enough to qualify for suggestions, but nothing in the
+    # build is close enough for a guess to be worth making.
+    warnings = []
+    reg = filtered(
+        fixture_so,
+        ["sample::HkTlm_t", "UnbuiltApp::AlphaTlm_t", "UnbuiltApp::BetaTlm_t"],
+        warn=warnings.append,
+    )
+    assert len(reg.unresolved) == 2
+    assert len(warnings) == 1
+    assert "did you mean" not in warnings[0]

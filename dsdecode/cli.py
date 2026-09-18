@@ -20,7 +20,7 @@ from .dictionary import (
     safe_name,
 )
 from .dsfile import HEADER_AUTO, HEADER_CFE, HEADER_NONE, DsFile, DsFileError, Geometry, summarize
-from .dwarf import DwarfError, NameFilter, extract
+from .dwarf import DwarfError, NameFilter, describe_missing, extract
 from .typemodel import GEOMETRY_TYPES, TypeRegistry
 from .writers import make_sink
 
@@ -85,7 +85,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
             verbose=args.verbose,
             warn=_warn,
             names=names,
-            allow_missing=args.allow_missing,
+            strict=args.strict,
         )
     except DwarfError as exc:
         print("error: %s" % exc, file=sys.stderr)
@@ -104,14 +104,16 @@ def cmd_extract(args: argparse.Namespace) -> int:
             "  filtered to the %d struct(s) named in %s, and what they depend on"
             % (len(wanted), args.mids)
         )
-        print("  structs from the mapping:")
         apps = mapping.struct_apps()
-        for name in wanted:
+        found = [name for name in wanted if name not in registry.unresolved]
+        print("  structs from the mapping:")
+        for name in found:
             owners = apps.get(name)
             print(
                 "    %-34s %s%s"
                 % (name, names.describe(name), ("  [%s]" % ", ".join(owners)) if owners else "")
             )
+        _report_absent_structs(registry, names, args.verbose)
         _report_mapping_gaps(mapping)
     if registry.geometry:
         print("  header sizes:")
@@ -133,6 +135,24 @@ def cmd_extract(args: argparse.Namespace) -> int:
         for name in sorted(registry.types):
             print("    %s" % name)
     return 0
+
+
+def _report_absent_structs(registry: Any, names: Any, verbose: bool) -> None:
+    """Account for structs the mapping named that this build does not have.
+
+    A mapping normally covers a whole code base, so this list can be long.  It
+    stays behind a count unless asked for, or the audit list above is buried.
+    """
+    absent = registry.unresolved
+    if not absent:
+        return
+    print(
+        "  %d struct(s) named in the mapping are not in this build%s"
+        % (len(absent), ", left out:" if verbose else " (run with -v to list them)")
+    )
+    if verbose:
+        for line in describe_missing(names, absent):
+            print("    %s" % line)
 
 
 def _report_mapping_gaps(mapping: Any) -> None:
@@ -406,9 +426,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     extract_parser.add_argument(
-        "--allow-missing",
+        "--strict",
         action="store_true",
-        help="warn instead of failing when a struct in the mapping is not found",
+        help=(
+            "fail if any struct named in the mapping is not in these binaries, "
+            "instead of leaving it out and carrying on"
+        ),
     )
     extract_parser.add_argument(
         "-v", "--verbose", action="store_true", help="list every type kept"
