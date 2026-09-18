@@ -327,3 +327,56 @@ def test_declared_values_decode_at_the_right_offsets(registry):
     row = dict(zip(decoder.columns, decoder.decode(raw)))
     assert row["Counter"] == 7
     assert [row["Words[%d]" % i] for i in range(3)] == [1, 2, 3]
+
+
+# -- a command with no arguments -------------------------------------------
+
+
+def test_a_no_arg_command_is_all_header_and_has_no_payload_columns(registry):
+    """The mapped type is the header itself, not a struct that starts with one."""
+    decoder = compile_struct(
+        registry, "PROJ_NO_ARG_CMD_T", Options(header_types=["PROJ_MSG_CMD_HDR_T"])
+    )
+    assert decoder.has_header
+    assert decoder.header_size == 8
+    assert decoder.columns == []
+
+
+def test_declaring_the_no_arg_type_itself_is_enough(registry):
+    # Whichever name you happen to have written down should work.
+    decoder = compile_struct(
+        registry, "PROJ_NO_ARG_CMD_T", Options(header_types=["PROJ_NO_ARG_CMD_T"])
+    )
+    assert decoder.has_header
+    assert decoder.columns == []
+
+
+def test_a_cfe_no_arg_command_needs_nothing_declared(registry):
+    decoder = compile_struct(registry, "CFE_STYLE_NO_ARG_CMD_T")
+    assert decoder.has_header
+    assert decoder.header_size == 8
+    assert decoder.columns == [], "the secondary header is not payload"
+
+
+def test_a_header_mapped_directly_is_treated_the_same(registry):
+    decoder = compile_struct(registry, "CFE_MSG_CommandHeader_t")
+    assert decoder.has_header
+    assert decoder.header_size == 8
+    assert decoder.columns == []
+
+
+def test_an_undeclared_no_arg_command_still_warns(registry):
+    warnings = []
+    decoder = compile_struct(registry, "PROJ_NO_ARG_CMD_T", warn=warnings.append)
+    assert not decoder.has_header
+    assert decoder.columns, "its header fields show up as columns"
+
+
+def test_a_message_with_a_real_payload_is_unaffected(registry):
+    decoder = compile_struct(
+        registry,
+        "PROJ_Tlm_t",
+        Options(header_types=["PROJ_MSG_TLM_HDR_T", "PROJ_MSG_CMD_HDR_T"]),
+    )
+    assert decoder.header_size == 12
+    assert decoder.columns == ["Counter", "Words[0]", "Words[1]", "Words[2]"]

@@ -123,6 +123,11 @@ mids:
 A declared header needs no particular size. If yours has no trailing spare where the cFE one does,
 the struct's own layout is what gets used, so the payload starts where that struct says it does.
 
+A command with no arguments is a header and nothing else, so its mapped type *is* the header
+rather than a struct that begins with one. That works the same way: declare the type, or the
+header it is a typedef of, and it decodes with no payload columns at all. The row still tells you
+when the command was sent and which function code it carried.
+
 ### If a script already finds your message IDs
 
 If you generate a message ID map by scanning your flight software, pass that file to `--mids`

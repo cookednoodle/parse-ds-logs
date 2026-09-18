@@ -132,6 +132,25 @@ typedef struct
     PROJ_TLM_SEC_HDR_T tSecHdr;
 } PROJ_MSG_TLM_HDR_T;
 
+typedef struct
+{
+    uint8 iFunctionCode;
+    uint8 iChecksum;
+} PROJ_CMD_SEC_HDR_T;
+
+typedef struct
+{
+    PROJ_PRI_HDR_T     tPriHdr;
+    PROJ_CMD_SEC_HDR_T tSecHdr;
+} PROJ_MSG_CMD_HDR_T;
+
+/* A command with no arguments is the header and nothing else, so the mapped
+ * type is the header rather than a struct that starts with one. */
+typedef PROJ_MSG_CMD_HDR_T PROJ_NO_ARG_CMD_T;
+
+/* The same shape built on the cFE header. */
+typedef CFE_MSG_CommandHeader_t CFE_STYLE_NO_ARG_CMD_T;
+
 /* Named to look like cFE, but a typedef of the project's own struct. */
 typedef PROJ_MSG_TLM_HDR_T CFE_MSG_TLM_HDR_T;
 

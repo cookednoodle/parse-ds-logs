@@ -74,6 +74,9 @@ extern "C" const char *dsdecode_layout(void)
     SIZEOF(PROJ_MSG_TLM_HDR_T);
     SIZEOF(PROJ_Tlm_t);
     SIZEOF(PROJ_Payload_t);
+    SIZEOF(PROJ_MSG_CMD_HDR_T);
+    SIZEOF(PROJ_NO_ARG_CMD_T);
+    SIZEOF(CFE_STYLE_NO_ARG_CMD_T);
     OFFSET(PROJ_MSG_TLM_HDR_T, tSecHdr);
     OFFSET(PROJ_Tlm_t, Counter);
     OFFSET(PROJ_Tlm_t, Words);
@@ -220,6 +223,8 @@ extern "C" void dsdecode_instantiate(void)
     static ANON_Tlm_t           anon_tlm;
     static PROJ_Tlm_t           proj_tlm;
     static PROJ_Payload_t       proj_payload;
+    static PROJ_NO_ARG_CMD_T    proj_no_arg;
+    static CFE_STYLE_NO_ARG_CMD_T cfe_no_arg;
     static CFE_FS_Header_t      fs_header;
     static DS_FileHeader_t      ds_header;
     (void)hk;
@@ -230,6 +235,8 @@ extern "C" void dsdecode_instantiate(void)
     (void)anon_tlm;
     (void)proj_tlm;
     (void)proj_payload;
+    (void)proj_no_arg;
+    (void)cfe_no_arg;
     (void)fs_header;
     (void)ds_header;
 }

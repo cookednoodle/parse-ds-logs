@@ -271,7 +271,13 @@ def compile_struct(
     if node.kind not in (KIND_STRUCT, KIND_UNION):
         raise DecodeError("type %r is a %s, not a struct" % (type_key, node.kind))
     builder = _Builder(registry, options, type_key)
-    header_size = builder.walk_top(node)
+    if builder.is_header(type_key):
+        # The message is a header and nothing else, which is how a command
+        # with no arguments is written.  There is no payload to give columns
+        # to, and the whole struct is the header.
+        header_size = node.size
+    else:
+        header_size = builder.walk_top(node)
     builder.report(warn)
     fields = builder.fields
     return Decoder(
@@ -331,7 +337,12 @@ class _Builder(object):
             return _INT_FORMATS.get(size)
         return _UINT_FORMATS.get(size)
 
-    def _is_header(self, type_key: str) -> bool:
+    def is_header(self, type_key: str) -> bool:
+        """Whether this type is a packet header, under any name it is known by.
+
+        Asked of a member to find the header at the start of a message, and of
+        a whole message type, which is what a command with no arguments is.
+        """
         known = self._known_headers
         for name in self.registry.typedef_chain(type_key):
             if name in known:
@@ -349,7 +360,7 @@ class _Builder(object):
         """
         header_size = 0
         for member in node.members:
-            if self._is_header(member.type) and member.offset == 0:
+            if self.is_header(member.type) and member.offset == 0:
                 header_size = self.registry.sizeof(member.type) or 0
                 continue
             self._walk_member(member, "", 0, 1)
