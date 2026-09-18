@@ -450,13 +450,41 @@ def _add_layout_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+# What a process killed by SIGPIPE reports.  A reader closing the pipe early
+# amounts to the same thing, so say so the same way.
+EXIT_BROKEN_PIPE = 141
+
+
+def _discard_remaining_output() -> None:
+    """Send anything still to be written to os.devnull.
+
+    Python flushes the standard streams on the way out.  With the pipe already
+    closed that raises a second time, printing "Exception ignored" over
+    whatever the reader did want, so point the stream somewhere harmless first.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if not getattr(args, "command", None):
-        parser.print_help()
-        return 2
-    return args.func(args)
+    try:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        if not getattr(args, "command", None):
+            parser.print_help()
+            return 2
+        status = args.func(args)
+        # Buffered output can fail here rather than at any one print.
+        sys.stdout.flush()
+        return status
+    except BrokenPipeError:
+        # A reader stopped early, as in 'dsdecode info file.ds | head'.  That
+        # is the reader's business, not a failure worth a traceback.
+        _discard_remaining_output()
+        return EXIT_BROKEN_PIPE
 
 
 if __name__ == "__main__":

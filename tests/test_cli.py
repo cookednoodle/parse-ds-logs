@@ -7,11 +7,15 @@ import io
 import json
 import os
 import struct
+import subprocess
+import sys
 
 import pytest
 
 import make_dsfile as mk
-from dsdecode.cli import main
+from dsdecode.cli import EXIT_BROKEN_PIPE, main
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 HK_MID = 0x0890
 GLOBAL_MID = 0x0891
@@ -514,3 +518,49 @@ def test_a_malformed_mapping_is_caught_at_extract_time(workspace, tmp_path, caps
         handle.write("mids:\n  NO_VALUE_MID: {struct: sample::HkTlm_t}\n")
     assert main(["extract", "--mids", mids, "-o", str(tmp_path / "x.json"), workspace["so"]]) == 1
     assert "no message ID" in capsys.readouterr().err
+
+
+# -- a reader that stops early ---------------------------------------------
+
+
+def run_with_no_reader(argv):
+    """Run the command with its stdout going to a pipe nobody reads.
+
+    Closing the read end before the child starts makes its first write fail,
+    which is what `dsdecode info file.ds | head` does once head has gone, minus
+    the race that makes timing-based versions of this test flaky.
+    """
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [REPO_ROOT] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "dsdecode.cli"] + list(argv),
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+    finally:
+        os.close(write_fd)
+    _, errors = process.communicate()
+    return process.returncode, errors.decode("utf-8", "replace")
+
+
+def test_info_survives_a_reader_that_stops_early(workspace):
+    code, errors = run_with_no_reader(["info", workspace["ds"]])
+    assert "Traceback" not in errors
+    assert "BrokenPipeError" not in errors
+    assert "Exception ignored" not in errors
+    assert code == EXIT_BROKEN_PIPE
+
+
+def test_extract_survives_a_reader_that_stops_early(workspace, tmp_path):
+    code, errors = run_with_no_reader(
+        ["extract", "-v", "-o", str(tmp_path / "types-pipe.json"), workspace["so"]]
+    )
+    assert "Traceback" not in errors
+    assert "BrokenPipeError" not in errors
+    assert code == EXIT_BROKEN_PIPE
