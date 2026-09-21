@@ -631,3 +631,150 @@ def test_an_undeclared_project_header_warns_with_the_remedy(tmp_path, registry):
         warn=warnings.append,
     )
     assert any("PROJ_Tlm_t" in w and "--header-type" in w for w in warnings)
+
+
+# -- saying how a union is used ---------------------------------------------
+
+ITEM_MIDS = (
+    "mids:\n"
+    "  ITEM_TLM_MID: {value: 0x0893, struct: sample::ItemTlm_t}\n"
+    "  UNION_TLM_MID: {value: 0x0894, struct: sample::UnionTlm_t}\n"
+)
+
+
+def test_a_unions_section_reaches_the_decoder(tmp_path, registry):
+    mids = load(
+        tmp_path,
+        "unions:\n"
+        "  sample::Item_t:\n"
+        "    tag: Hdr.Kind\n"
+        "    cases: {ITEM_TEMP: Temp, ITEM_COUNT: Count}\n"
+        "  sample::Value_t: {keep: [i, f]}\n" + ITEM_MIDS,
+        registry,
+    )
+    items = mids.lookup(0x0893).decoder_for(None)
+    assert items.columns[:5] == [
+        "Items[0].Hdr.Kind",
+        "Items[0].Hdr.Seq",
+        "Items[0].Temp.Celsius",
+        "Items[0].Count.Count",
+        "Items[0].Count.Flags",
+    ]
+    assert mids.lookup(0x0894).decoder_for(None).columns == ["Value.i", "Value.f", "Tag"]
+
+
+def test_a_union_may_be_named_without_its_namespace(tmp_path, registry):
+    mids = load(tmp_path, "unions:\n  Value_t: {drop: b}\n" + ITEM_MIDS, registry)
+    assert mids.lookup(0x0894).decoder_for(None).columns == ["Value.i", "Value.f", "Tag"]
+
+
+def test_union_bytes_in_the_mapping_drops_byte_views_everywhere(tmp_path, registry):
+    mids = load(tmp_path, "union_bytes: drop\n" + ITEM_MIDS, registry)
+    assert mids.lookup(0x0894).decoder_for(None).columns == ["Value.i", "Value.f", "Tag"]
+    assert "Items[0].Bytes[0]" not in mids.lookup(0x0893).decoder_for(None).columns
+
+
+def test_union_bytes_passed_by_the_caller_works_the_same(tmp_path, registry):
+    mids = load(tmp_path, ITEM_MIDS, registry, options=Options(union_bytes="drop"))
+    assert mids.lookup(0x0894).decoder_for(None).columns == ["Value.i", "Value.f", "Tag"]
+
+
+def test_the_settings_work_in_a_file_with_no_mids_key(tmp_path, registry):
+    mids = load(
+        tmp_path,
+        "union_bytes: drop\n"
+        "unions:\n  sample::Item_t: {tag: Hdr.Kind, cases: {1: Temp}}\n"
+        "0x0893: sample::ItemTlm_t\n"
+        "0x0894: sample::UnionTlm_t\n",
+        registry,
+    )
+    assert mids.lookup(0x0893) is not None, "the settings must not be read as message IDs"
+    assert "Items[0].Count.Count" not in mids.lookup(0x0893).decoder_for(None).columns
+    assert mids.lookup(0x0894).decoder_for(None).columns == ["Value.i", "Value.f", "Tag"]
+
+
+def test_a_union_not_in_the_type_file_is_passed_over_with_a_warning(tmp_path, registry):
+    warnings = []
+    mids = load(
+        tmp_path,
+        "unions:\n  OtherApp::Payload_t: {tag: Id, cases: {1: A}}\n" + ITEM_MIDS,
+        registry,
+        warn=warnings.append,
+    )
+    assert mids.lookup(0x0893) is not None
+    assert any("OtherApp::Payload_t" in w and "ignored" in w for w in warnings)
+
+
+def test_a_union_entry_naming_a_struct_is_an_error(tmp_path, registry):
+    with pytest.raises(DictionaryError) as caught:
+        load(tmp_path, "unions:\n  sample::Vec3: {keep: x}\n" + ITEM_MIDS, registry)
+    assert "not a union" in str(caught.value)
+
+
+def test_a_wrong_member_is_an_error_that_names_the_file_and_entry(tmp_path, registry):
+    with pytest.raises(DictionaryError) as caught:
+        load(
+            tmp_path,
+            "unions:\n  sample::Item_t: {tag: Hdr.Id, cases: {1: Temp}}\n" + ITEM_MIDS,
+            registry,
+        )
+    message = str(caught.value)
+    assert "mids.yaml" in message
+    assert "unions.sample::Item_t" in message
+    assert "no member 'Id'" in message
+
+
+def test_a_wrong_keep_is_caught_when_the_mapping_is_loaded(tmp_path, registry):
+    with pytest.raises(DictionaryError) as caught:
+        load(tmp_path, "unions:\n  sample::Value_t: {keep: [x]}\n" + ITEM_MIDS, registry)
+    assert "no member 'x'" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "spec, complaint",
+    [
+        ("{}", "says nothing"),
+        ("{keep: i, drop: b}", "not both"),
+        ("{tag: Hdr.Kind}", "needs 'cases'"),
+        ("{cases: {1: Temp}}", "needs 'tag'"),
+        ("{tag: Hdr.Kind, cases: {1: Temp}, drop: Bytes}", "cannot go with 'tag'"),
+        ("{tag: Hdr.Kind, cases: {1: 7}}", "must name a member"),
+        ("{keep: []}", "names no member"),
+        ("{keep: 5}", "member name or a list"),
+        ("{tag: 5, cases: {1: Temp}}", "name the member"),
+        ("{tags: Hdr.Kind}", "unknown key"),
+        ("Temp", "must be a mapping"),
+    ],
+)
+def test_a_malformed_union_entry_is_rejected_before_any_types_are_read(tmp_path, spec, complaint):
+    from dsdecode.dictionary import read_mapping
+
+    with pytest.raises(DictionaryError) as caught:
+        read_mapping(write_mids(tmp_path, "unions:\n  sample::Item_t: %s\n" % spec + ITEM_MIDS))
+    assert complaint in str(caught.value)
+    assert "unions.sample::Item_t" in str(caught.value)
+
+
+def test_a_bad_union_bytes_value_is_rejected(tmp_path):
+    from dsdecode.dictionary import read_mapping
+
+    with pytest.raises(DictionaryError) as caught:
+        read_mapping(write_mids(tmp_path, "union_bytes: sometimes\n" + ITEM_MIDS))
+    assert "keep or drop" in str(caught.value)
+
+
+def test_unions_may_be_written_as_json(tmp_path, registry):
+    path = write_mids(
+        tmp_path,
+        json.dumps(
+            {
+                "unions": {"sample::Item_t": {"tag": "Hdr.Kind", "cases": {"1": "Temp"}}},
+                "mids": {"ITEM": {"value": 2195, "struct": "sample::ItemTlm_t"}},
+            }
+        ),
+        name="mids.json",
+    )
+    mids = Dictionary.load(path, registry, Geometry.from_registry(registry))
+    columns = mids.lookup(0x0893).decoder_for(None).columns
+    assert "Items[0].Temp.Celsius" in columns
+    assert "Items[0].Count.Count" not in columns

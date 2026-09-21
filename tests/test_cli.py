@@ -886,3 +886,126 @@ def test_the_cfe_path_is_unchanged_by_all_this(workspace, tmp_path):
     rows = read_csv(os.path.join(out_dir, "SAMPLE_HK_TLM_MID.csv"))
     assert rows[0]["Payload.Name"] == "hello"
     assert "TelemetryHeader.Msg.CCSDS.Pri.StreamId[0]" not in rows[0]
+
+
+# -- saying how a union is used ---------------------------------------------
+
+ITEM_MID = 0x0893
+UNION_MID = 0x0894
+
+UNION_MIDS = """
+unions:
+  sample::Item_t:
+    tag: Hdr.Kind
+    cases: {ITEM_TEMP: Temp, ITEM_COUNT: Count}
+mids:
+  ITEM_TLM_MID:  {value: 0x0893, struct: sample::ItemTlm_t}
+  UNION_TLM_MID: {value: 0x0894, struct: sample::UnionTlm_t}
+"""
+
+
+def item_packet(first, second):
+    payload = b""
+    for kind, seq, body in (first, second):
+        payload += struct.pack("<II", kind, seq) + body.ljust(8, b"\x00")
+    return mk.tlm_packet(ITEM_MID, payload=payload)
+
+
+@pytest.fixture
+def union_workspace(tmp_path, fixture_so):
+    mids = str(tmp_path / "unions.yaml")
+    with io.open(mids, "w", encoding="utf-8") as handle:
+        handle.write(UNION_MIDS)
+    types = str(tmp_path / "types-unions.json")
+    assert main(["extract", "--mids", mids, "-o", types, fixture_so]) == 0
+    ds = str(tmp_path / "unions.ds")
+    mk.write_ds_file(
+        ds,
+        [
+            item_packet((1, 5, struct.pack("<f", 1.5)), (2, 6, struct.pack("<IB", 77, 3))),
+            item_packet((2, 7, struct.pack("<IB", 8, 0)), (9, 8, b"")),
+            mk.tlm_packet(UNION_MID, payload=struct.pack("<fI", 2.5, 1)),
+        ],
+    )
+    return {"mids": mids, "types": types, "ds": ds, "dir": str(tmp_path)}
+
+
+def decode_unions(workspace, tmp_path, name, extra=()):
+    out_dir = str(tmp_path / ("out-%s" % name))
+    code = main(
+        ["decode", "--types", workspace["types"], "--mids", workspace["mids"], "--out", out_dir]
+        + list(extra)
+        + [workspace["ds"]]
+    )
+    return code, out_dir
+
+
+def test_a_tagged_union_fills_only_the_alternative_the_identifier_names(
+    union_workspace, tmp_path
+):
+    code, out_dir = decode_unions(union_workspace, tmp_path, "tagged")
+    assert code == 0
+    rows = read_csv(os.path.join(out_dir, "ITEM_TLM_MID.csv"))
+    assert len(rows) == 2
+    payload_columns = [c for c in rows[0] if c.startswith("Items")]
+    assert payload_columns == [
+        "Items[0].Hdr.Kind",
+        "Items[0].Hdr.Seq",
+        "Items[0].Temp.Celsius",
+        "Items[0].Count.Count",
+        "Items[0].Count.Flags",
+        "Items[1].Hdr.Kind",
+        "Items[1].Hdr.Seq",
+        "Items[1].Temp.Celsius",
+        "Items[1].Count.Count",
+        "Items[1].Count.Flags",
+    ]
+    first, second = rows
+    assert first["Items[0].Hdr.Kind"] == "ITEM_TEMP"
+    assert first["Items[0].Temp.Celsius"] == "1.5"
+    assert first["Items[0].Count.Count"] == ""
+    assert first["Items[1].Hdr.Kind"] == "ITEM_COUNT"
+    assert first["Items[1].Temp.Celsius"] == ""
+    assert (first["Items[1].Count.Count"], first["Items[1].Count.Flags"]) == ("77", "3")
+    # An identifier with no case: the row says which value it was, nothing else.
+    assert second["Items[1].Hdr.Kind"] == "9"
+    assert second["Items[1].Temp.Celsius"] == ""
+    assert second["Items[1].Count.Count"] == ""
+
+
+def test_byte_views_stay_unless_asked_to_go(union_workspace, tmp_path):
+    code, out_dir = decode_unions(union_workspace, tmp_path, "keep")
+    assert code == 0
+    row = read_csv(os.path.join(out_dir, "UNION_TLM_MID.csv"))[0]
+    assert row["Value.f"] == "2.5"
+    assert "Value.b[0]" in row
+    code, out_dir = decode_unions(union_workspace, tmp_path, "drop", ["--union-bytes", "drop"])
+    assert code == 0
+    row = read_csv(os.path.join(out_dir, "UNION_TLM_MID.csv"))[0]
+    assert row["Value.f"] == "2.5"
+    assert "Value.b[0]" not in row
+    assert list(row)[-3:] == ["Value.i", "Value.f", "Tag"]
+
+
+def test_a_wrong_union_entry_stops_the_decode_with_the_entry_named(
+    union_workspace, tmp_path, capsys
+):
+    with io.open(union_workspace["mids"], "w", encoding="utf-8") as handle:
+        handle.write(UNION_MIDS.replace("unions:\n", "unions:\n  sample::Value_t: {keep: [x]}\n"))
+    code, _ = decode_unions(union_workspace, tmp_path, "bad")
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "unions.sample::Value_t" in err
+    assert "no member 'x'" in err
+
+
+def test_extract_reads_a_mapping_with_a_unions_section(union_workspace, capsys):
+    """The section is judged for shape at extract time, like the rest of the file."""
+    with io.open(union_workspace["mids"], "w", encoding="utf-8") as handle:
+        handle.write(
+            UNION_MIDS.replace("unions:\n", "unions:\n  sample::Value_t: {keep: i, drop: b}\n")
+        )
+    types = os.path.join(union_workspace["dir"], "unused.json")
+    code = main(["extract", "--mids", union_workspace["mids"], "-o", types, union_workspace["dir"]])
+    assert code == 1
+    assert "not both" in capsys.readouterr().err

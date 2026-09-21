@@ -66,6 +66,10 @@ extern "C" const char *dsdecode_layout(void)
     SIZEOF(sample::HkTlm_t);
     SIZEOF(sample::UnionTlm_t);
     SIZEOF(sample::Value_t);
+    SIZEOF(sample::Item_t);
+    SIZEOF(sample::TempItem_t);
+    SIZEOF(sample::CountItem_t);
+    SIZEOF(sample::ItemTlm_t);
     SIZEOF(sample::NoopCmd_t);
     SIZEOF(sample::SetModeCmd_t);
     SIZEOF(GLOBAL_Tlm_t);
@@ -108,6 +112,10 @@ extern "C" const char *dsdecode_layout(void)
     OFFSET(sample::HkPayload, Bits);
     OFFSET(sample::UnionTlm_t, Value);
     OFFSET(sample::UnionTlm_t, Tag);
+    OFFSET(sample::TempItem_t, Celsius);
+    OFFSET(sample::CountItem_t, Count);
+    OFFSET(sample::CountItem_t, Flags);
+    OFFSET(sample::ItemTlm_t, Items);
     OFFSET(sample::SetModeCmd_t, Mode);
     OFFSET(GLOBAL_Tlm_t, Counter);
     OFFSET(GLOBAL_Tlm_t, Words);
@@ -217,6 +225,7 @@ extern "C" void dsdecode_instantiate(void)
 {
     static sample::HkTlm_t      hk;
     static sample::UnionTlm_t   uni;
+    static sample::ItemTlm_t    items;
     static sample::NoopCmd_t    noop;
     static sample::SetModeCmd_t set_mode;
     static GLOBAL_Tlm_t         global_tlm;
@@ -229,6 +238,7 @@ extern "C" void dsdecode_instantiate(void)
     static DS_FileHeader_t      ds_header;
     (void)hk;
     (void)uni;
+    (void)items;
     (void)noop;
     (void)set_mode;
     (void)global_tlm;

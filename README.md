@@ -128,6 +128,68 @@ rather than a struct that begins with one. That works the same way: declare the 
 header it is a typedef of, and it decodes with no payload columns at all. The row still tells you
 when the command was sent and which function code it carried.
 
+### If a union is not really several fields
+
+A union gets a column per member, each decoded from the same bytes, because the type alone
+does not say which member the bytes are. That is the safe default and usually the wrong
+answer. Two shapes come up all the time in flight software, and the mapping can name them:
+
+```yaml
+unions:
+  # Several views of one value: say which members are worth a column.
+  MyApp::Value_t: {keep: [i, f]}          # or: {drop: b}
+
+  # An identifier says what the rest of the bytes are.
+  MyApp::Item_t:
+    tag: Hdr.Kind
+    cases:
+      ITEM_TEMP: Temp
+      ITEM_COUNT: Count
+
+mids:
+  MY_APP_ITEM_TLM_MID: {value: 0x0893, struct: MyApp::ItemTlm_t}
+```
+
+Union names are looked up the same forgiving way as struct names. An entry naming a union
+this build does not have is passed over with a warning, since the mapping may cover more
+than one build; one naming a member the union lacks is an error, caught when the mapping is
+loaded rather than when a packet turns up.
+
+**`keep` or `drop`** picks members of a union whose members are all views of the same
+storage. Only the ones kept get columns.
+
+**`tag` and `cases`** describe a tagged union, the pattern where one member is an
+identifier and every other member is a struct that begins with that same identifier
+followed by its own fields:
+
+```c
+typedef struct { ItemKind_t Kind; uint32 Seq; } ItemHdr_t;
+typedef struct { ItemHdr_t Hdr; float  Celsius; } TempItem_t;
+typedef struct { ItemHdr_t Hdr; uint32 Count; uint8 Flags; } CountItem_t;
+typedef union  { ItemHdr_t Hdr; TempItem_t Temp; CountItem_t Count; uint8 Bytes[16]; } Item_t;
+```
+
+`tag` is the path to the identifier, through nested structs if need be, so the member the
+path starts at is the identifier and is always decoded. `cases` maps each value the identifier
+can take to the member the bytes are then. Keys are numbers, or enumerator names when the
+identifier is an enum, and several keys may name the same member. The row keeps every
+alternative's columns, so a CSV has one fixed shape, but only the alternative the identifier
+names is filled in; the others are empty. The identifier at the start of each alternative is
+left out, since it already has its own column. A value with no case leaves every alternative
+empty, and the identifier column says which value it was. Members named neither in `cases`
+nor under `keep` get no columns at all, which is where a `Bytes[16]` view goes.
+
+Arrays of tagged unions work the same, one identifier per element. For the example above
+you get `Items[0].Hdr.Kind`, `Items[0].Hdr.Seq`, `Items[0].Temp.Celsius`,
+`Items[0].Count.Count`, `Items[0].Count.Flags`, and so on for `Items[1]`, in place of the
+fifty columns the type alone would give.
+
+**`union_bytes: drop`** covers the rest at a stroke. In every union the mapping does not
+describe, a member that is an array of bytes over the same storage, `uint8 Raw[4]` beside a
+`float`, is left out. A union of nothing but byte arrays is kept as it is. Anonymous unions,
+which no entry could name, are covered too. `--union-bytes drop` on `decode` does the same
+from the command line, and an entry under `unions` still wins for the union it names.
+
 ### If a script already finds your message IDs
 
 If you generate a message ID map by scanning your flight software, pass that file to `--mids`
@@ -253,7 +315,10 @@ Every row starts with the same fixed columns:
 Then one column per field, named by the path taken to reach it: `Payload.Position.x`,
 `Payload.Matrix[1][2]`, `Payload.Bits.c`. A `char` array is one string column cut at the first
 NUL; a `uint8` array stays one numeric column per byte. Enums report the enumerator name.
-Union members all appear, each decoded from the same bytes.
+Union members all appear, each decoded from the same bytes, unless the mapping says how the
+union is used (see **If a union is not really several fields** above): then a union of views
+shows only the members kept, and a tagged union fills in only the alternative its identifier
+names, leaving the others empty.
 
 Useful flags:
 
@@ -261,6 +326,7 @@ Useful flags:
 - `--unknown raw` also write unmapped IDs as a hex `raw` column
 - `--format jsonl` JSON Lines instead of CSV
 - `--enum-values` numbers instead of enumerator names
+- `--union-bytes drop` leave out byte-array views in unions the mapping does not describe
 - `--char-arrays bytes` one column per character
 - `--epoch 1980-01-01` add a UTC timestamp column, using your mission epoch
 - `--header none` files recorded with `DS_FILE_HEADER_TYPE` set to `DS_FILE_HEADER_NONE`

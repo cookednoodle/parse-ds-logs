@@ -380,3 +380,315 @@ def test_a_message_with_a_real_payload_is_unaffected(registry):
     )
     assert decoder.header_size == 12
     assert decoder.columns == ["Counter", "Words[0]", "Words[1]", "Words[2]"]
+
+
+# -- saying how a union is used ---------------------------------------------
+
+
+def item_packet(first, second):
+    """An ItemTlm_t packet: a header, then two 16-byte Item_t entries.
+
+    Each entry is (kind, seq, payload bytes); the payload follows the 8-byte
+    ItemHdr_t and is padded out to the union's size.
+    """
+    raw = b"\x00" * 16
+    for kind, seq, body in (first, second):
+        raw += struct.pack("<II", kind, seq) + body.ljust(8, b"\x00")
+    return raw
+
+
+def tagged(registry, **kwargs):
+    from dsdecode.decode import UnionUse
+
+    use = UnionUse(tag="Hdr.Kind", cases={"ITEM_TEMP": "Temp", 2: "Count"})
+    options = Options(unions={"sample::Item_t": use}, **kwargs)
+    return compile_struct(registry, "sample::ItemTlm_t", options)
+
+
+def test_a_union_left_alone_repeats_its_identifier_in_every_alternative(registry):
+    """The shape this feature exists to tidy up."""
+    decoder = compile_struct(registry, "sample::ItemTlm_t")
+    assert "Items[0].Hdr.Kind" in decoder.columns
+    assert "Items[0].Temp.Hdr.Kind" in decoder.columns
+    assert "Items[0].Count.Hdr.Kind" in decoder.columns
+    assert "Items[0].Bytes[15]" in decoder.columns
+    assert len(decoder.columns) == 50
+
+
+def test_a_tagged_union_has_the_identifier_once_and_each_alternative_once(registry):
+    decoder = tagged(registry)
+    assert decoder.columns == [
+        "Items[0].Hdr.Kind",
+        "Items[0].Hdr.Seq",
+        "Items[0].Temp.Celsius",
+        "Items[0].Count.Count",
+        "Items[0].Count.Flags",
+        "Items[1].Hdr.Kind",
+        "Items[1].Hdr.Seq",
+        "Items[1].Temp.Celsius",
+        "Items[1].Count.Count",
+        "Items[1].Count.Flags",
+    ]
+
+
+def test_only_the_alternative_the_identifier_names_is_filled(registry):
+    decoder = tagged(registry)
+    raw = item_packet(
+        (1, 5, struct.pack("<f", 1.5)),
+        (2, 6, struct.pack("<IB", 77, 3)),
+    )
+    row = as_row(decoder, raw)
+    assert row["Items[0].Hdr.Kind"] == "ITEM_TEMP"
+    assert row["Items[0].Hdr.Seq"] == 5
+    assert row["Items[0].Temp.Celsius"] == 1.5
+    assert row["Items[0].Count.Count"] is None
+    assert row["Items[0].Count.Flags"] is None
+    assert row["Items[1].Hdr.Kind"] == "ITEM_COUNT"
+    assert row["Items[1].Temp.Celsius"] is None
+    assert row["Items[1].Count.Count"] == 77
+    assert row["Items[1].Count.Flags"] == 3
+
+
+def test_an_identifier_with_no_case_leaves_every_alternative_empty(registry):
+    decoder = tagged(registry)
+    raw = item_packet((9, 5, struct.pack("<f", 1.5)), (0, 6, b""))
+    row = as_row(decoder, raw)
+    # The identifier column still says what turned up.
+    assert row["Items[0].Hdr.Kind"] == 9
+    assert row["Items[1].Hdr.Kind"] == "ITEM_NONE"
+    for name in decoder.columns:
+        if "Hdr" not in name:
+            assert row[name] is None, name
+
+
+def test_case_keys_may_be_numbers_or_enumerator_names(registry):
+    from dsdecode.decode import UnionUse
+
+    by_name = UnionUse(tag="Hdr.Kind", cases={"ITEM_TEMP": "Temp", "ITEM_COUNT": "Count"})
+    by_value = UnionUse(tag="Hdr.Kind", cases={1: "Temp", "0x2": "Count"})
+    raw = item_packet((1, 5, struct.pack("<f", 1.5)), (2, 6, struct.pack("<IB", 77, 3)))
+    rows = []
+    for use in (by_name, by_value):
+        decoder = compile_struct(
+            registry, "sample::ItemTlm_t", Options(unions={"sample::Item_t": use})
+        )
+        rows.append(decoder.decode(raw))
+    assert rows[0] == rows[1]
+
+
+def test_several_values_may_select_one_alternative(registry):
+    from dsdecode.decode import UnionUse
+
+    use = UnionUse(tag="Hdr.Kind", cases={1: "Temp", 2: "Temp", 3: "Count"})
+    decoder = compile_struct(registry, "sample::ItemTlm_t", Options(unions={"sample::Item_t": use}))
+    assert decoder.columns.count("Items[0].Temp.Celsius") == 1
+    raw = item_packet((2, 0, struct.pack("<f", 2.5)), (3, 0, struct.pack("<IB", 1, 1)))
+    row = as_row(decoder, raw)
+    assert row["Items[0].Temp.Celsius"] == 2.5
+    assert row["Items[1].Count.Count"] == 1
+
+
+def test_a_short_packet_blanks_the_alternative_it_cuts_into(registry):
+    decoder = tagged(registry)
+    raw = item_packet((1, 5, struct.pack("<f", 1.5)), (2, 6, struct.pack("<IB", 77, 3)))
+    # Cut inside the second item's Count payload: after its header and Count,
+    # before Flags.
+    row = as_row_limited(decoder, raw[: 16 + 16 + 8 + 4])
+    assert row["Items[0].Temp.Celsius"] == 1.5
+    assert row["Items[1].Hdr.Kind"] == "ITEM_COUNT"
+    assert row["Items[1].Count.Count"] == 77
+    assert row["Items[1].Count.Flags"] is None
+    # Cut before the second identifier can be read: nothing of it is guessed.
+    row = as_row_limited(decoder, raw[: 16 + 16 + 2])
+    assert row["Items[1].Hdr.Kind"] is None
+    assert row["Items[1].Count.Count"] is None
+
+
+def test_a_tagged_union_reports_enums_as_numbers_when_asked(registry):
+    decoder = tagged(registry, enum_values=True)
+    raw = item_packet((1, 5, struct.pack("<f", 1.5)), (2, 6, b""))
+    row = as_row(decoder, raw)
+    assert row["Items[0].Hdr.Kind"] == 1
+    assert row["Items[0].Temp.Celsius"] == 1.5
+
+
+def test_keep_lists_the_members_that_get_columns(registry):
+    from dsdecode.decode import UnionUse
+
+    decoder = compile_struct(
+        registry, "sample::UnionTlm_t", Options(unions={"sample::Value_t": UnionUse(keep=["f"])})
+    )
+    assert decoder.columns == ["Value.f", "Tag"]
+
+
+def test_drop_lists_the_members_that_do_not(registry):
+    from dsdecode.decode import UnionUse
+
+    decoder = compile_struct(
+        registry, "sample::UnionTlm_t", Options(unions={"sample::Value_t": UnionUse(drop=["b"])})
+    )
+    assert decoder.columns == ["Value.i", "Value.f", "Tag"]
+
+
+def test_the_union_may_be_named_through_a_typedef_of_it(registry):
+    """Options are keyed by the union's own name; the loader resolves aliases."""
+    from dsdecode.decode import UnionUse
+
+    node = registry.resolve("sample::Value_t")
+    decoder = compile_struct(
+        registry, "sample::UnionTlm_t", Options(unions={node.name: UnionUse(keep=["i"])})
+    )
+    assert decoder.columns == ["Value.i", "Tag"]
+
+
+def test_byte_views_can_be_dropped_from_every_union_at_once(registry):
+    from dsdecode.decode import UNION_BYTES_DROP
+
+    decoder = compile_struct(registry, "sample::UnionTlm_t", Options(union_bytes=UNION_BYTES_DROP))
+    assert decoder.columns == ["Value.i", "Value.f", "Tag"]
+    # An anonymous union, which no entry could name, is covered too.
+    decoder = compile_struct(registry, "ANON_Tlm_t", Options(union_bytes=UNION_BYTES_DROP))
+    assert decoder.columns == ["Parts.lo", "Parts.hi", "whole"]
+
+
+def test_a_union_of_nothing_but_byte_views_keeps_them(registry):
+    from dsdecode.decode import UNION_BYTES_DROP
+    from dsdecode.typemodel import ArrayType, Member, StructType
+
+    extra = {
+        "OnlyBytes_t": StructType(
+            "OnlyBytes_t",
+            4,
+            [Member("Raw", 0, "uint8[4]"), Member("Signed", 0, "int8[4]")],
+            kind="union",
+        ),
+        "int8[4]": ArrayType("int8[4]", "int8", [4], 4),
+    }
+    decoder, warnings = awkward(
+        registry,
+        [Member("Both", 16, "OnlyBytes_t")],
+        extra=extra,
+        options=Options(union_bytes=UNION_BYTES_DROP),
+    )
+    assert warnings == []
+    assert decoder.columns == ["Both.Raw[%d]" % i for i in range(4)] + [
+        "Both.Signed[%d]" % i for i in range(4)
+    ]
+
+
+def test_a_char_array_is_text_not_a_byte_view(registry):
+    from dsdecode.decode import UNION_BYTES_DROP
+    from dsdecode.typemodel import Member, StructType
+
+    extra = {
+        "CodeOrText_t": StructType(
+            "CodeOrText_t",
+            12,
+            [Member("Code", 0, "uint32"), Member("Text", 0, "char[12]")],
+            kind="union",
+        ),
+    }
+    decoder, warnings = awkward(
+        registry,
+        [Member("Either", 16, "CodeOrText_t")],
+        extra=extra,
+        options=Options(union_bytes=UNION_BYTES_DROP),
+    )
+    assert warnings == []
+    assert decoder.columns == ["Either.Code", "Either.Text"]
+
+
+def test_an_explicit_entry_wins_over_the_byte_policy(registry):
+    from dsdecode.decode import UNION_BYTES_DROP, UnionUse
+
+    decoder = compile_struct(
+        registry,
+        "sample::UnionTlm_t",
+        Options(unions={"sample::Value_t": UnionUse(keep=["b"])}, union_bytes=UNION_BYTES_DROP),
+    )
+    assert decoder.columns == ["Value.b[0]", "Value.b[1]", "Value.b[2]", "Value.b[3]", "Tag"]
+
+
+def test_a_tagged_union_can_keep_a_member_whatever_the_identifier_says(registry):
+    from dsdecode.decode import UnionUse
+
+    use = UnionUse(tag="Hdr.Kind", cases={1: "Temp"}, keep=["Bytes"])
+    decoder = compile_struct(registry, "sample::ItemTlm_t", Options(unions={"sample::Item_t": use}))
+    assert "Items[0].Bytes[0]" in decoder.columns
+    assert "Items[0].Temp.Celsius" in decoder.columns
+    assert "Items[0].Count.Count" not in decoder.columns
+
+
+def plan_error(registry, union, **kwargs):
+    from dsdecode.decode import UnionUse, plan_union
+
+    with pytest.raises(DecodeError) as caught:
+        plan_union(registry, registry.resolve(union), UnionUse(**kwargs))
+    return str(caught.value)
+
+
+def test_a_tag_that_is_not_a_member_is_rejected_with_the_members_listed(registry):
+    message = plan_error(registry, "sample::Item_t", tag="Kind", cases={1: "Temp"})
+    assert "no member 'Kind'" in message
+    assert "Hdr, Temp, Count, Bytes" in message
+
+
+def test_a_tag_path_into_a_missing_member_is_rejected(registry):
+    message = plan_error(registry, "sample::Item_t", tag="Hdr.Id", cases={1: "Temp"})
+    assert "no member 'Id'" in message
+    assert "Kind, Seq" in message
+
+
+def test_a_tag_that_is_not_a_number_is_rejected(registry):
+    message = plan_error(registry, "sample::Item_t", tag="Temp", cases={1: "Count"})
+    assert "not an integer or enum" in message
+
+
+def test_a_case_naming_a_missing_member_is_rejected(registry):
+    message = plan_error(registry, "sample::Item_t", tag="Hdr.Kind", cases={1: "Pressure"})
+    assert "no member 'Pressure'" in message
+
+
+def test_a_case_naming_the_identifier_itself_is_rejected(registry):
+    message = plan_error(registry, "sample::Item_t", tag="Hdr.Kind", cases={1: "Hdr"})
+    assert "identifier itself" in message
+
+
+def test_an_enumerator_name_that_does_not_exist_is_rejected(registry):
+    message = plan_error(registry, "sample::Item_t", tag="Hdr.Kind", cases={"ITEM_HEAT": "Temp"})
+    assert "ITEM_HEAT" in message
+    assert "ITEM_TEMP" in message
+
+
+def test_a_name_is_no_use_when_the_identifier_is_a_plain_integer(registry):
+    message = plan_error(registry, "sample::Item_t", tag="Hdr.Seq", cases={"FIVE": "Temp"})
+    assert "not an enum" in message
+
+
+def test_one_value_cannot_select_two_alternatives(registry):
+    message = plan_error(
+        registry, "sample::Item_t", tag="Hdr.Kind", cases={1: "Temp", "ITEM_TEMP": "Count"}
+    )
+    assert "both Temp and Count" in message
+
+
+def test_a_member_cannot_be_both_kept_and_a_case(registry):
+    message = plan_error(
+        registry, "sample::Item_t", tag="Hdr.Kind", cases={1: "Temp"}, keep=["Temp"]
+    )
+    assert "cannot also be a case" in message
+
+
+def test_a_tag_needs_cases_and_cases_need_a_tag(registry):
+    assert "needs 'cases'" in plan_error(registry, "sample::Item_t", tag="Hdr.Kind")
+
+
+def test_keep_and_drop_are_checked_against_the_members(registry):
+    from dsdecode.decode import UnionUse
+
+    with pytest.raises(DecodeError) as caught:
+        compile_struct(
+            registry, "sample::UnionTlm_t", Options(unions={"sample::Value_t": UnionUse(keep=["x"])})
+        )
+    assert "no member 'x'" in str(caught.value)
+    assert "i, f, b" in str(caught.value)
